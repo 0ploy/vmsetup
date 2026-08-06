@@ -140,18 +140,18 @@ fly's model (`fly-io-init/src/lib.rs:16-33`) and Docker's semantics.
     { "device": "/dev/vdc", "path": "/data", "fstype": "ext4", "options": "relatime" }
   ],
 
-  // Single axis — see §4.3. Determines both what vminit does to the machine
+  // One flat axis — see §4.3. Decides both what vminit does to the machine
   // and whether it survives the handoff.
   "boot": {
-    "profile": "zpinit",         // "zpinit" | "command" | "exec" | "distro"
-    "path":    "/usr/local/bin/zpinit",
-    "args":    ["--vm"],
+    // zpinit | command | cloud-init | netplan | systemd-networkd | ifupdown
+    "profile": "zpinit",
 
-    // Read only when profile = "distro".
-    "distro": {
-      "renderer": "auto",        // auto|cloud-init|netplan|systemd-networkd|ifupdown|none
-      "init":     "/sbin/init"
-    }
+    // profile = "zpinit" only
+    "path": "/usr/local/bin/zpinit",
+    "args": ["--vm"],
+
+    // generate profiles only; override when the image's init is elsewhere
+    "init": "/sbin/init"
   },
 
   "logging": {
@@ -167,131 +167,128 @@ fly's model (`fly-io-init/src/lib.rs:16-33`) and Docker's semantics.
 }
 ```
 
-### 4.3 Profiles — one axis, not two
+### 4.3 Profiles — one flat axis
 
-Handoff strategy and config strategy are **not independent**. Of the twelve
-combinations an orthogonal design would expose, only five are meaningful:
-`zpinit` cannot read a `.network` file, and systemd cannot tolerate
-pre-mounted cgroups. Two knobs would invite configurations that cannot work.
+Handoff strategy and config strategy are **not independent**, so they are not
+separate knobs. One `profile` value decides both.
 
-So there is one axis. The profile determines both what vminit does to the
-machine and whether it survives the handoff:
+The rule that generates the whole table: **`execve` only when the target
+requires PID 1; otherwise fork.** zpinit requires PID 1 (its reaper is written
+for it). systemd requires PID 1 (it checks `getpid() == 1` and refuses to run
+as a system manager otherwise). A bare command does not.
 
 | `profile` | config strategy | handoff | PID 1 ends up as |
 | --- | --- | --- | --- |
 | `zpinit` | **apply** (§5) | `execve` | zpinit |
 | `command` | **apply** (§5) | fork + supervise | **vminit** |
-| `exec` | **apply** (§5) | `execve` | the workload |
-| `distro` | **generate** (§4.4) | `execve` | the image's own init |
+| `cloud-init` | generate (datasource pin only) | `execve` | the image's init |
+| `netplan` | generate | `execve` | the image's init |
+| `systemd-networkd` | generate | `execve` | the image's init |
+| `ifupdown` | generate | `execve` | the image's init |
 
 ```toml
 [boot]
-profile = "zpinit"          # zpinit | command | exec | distro
-
-[boot.distro]               # only read when profile = "distro"
-renderer = "auto"
-init     = "/sbin/init"
+profile = "zpinit"
+init    = "/sbin/init"   # generate profiles only; override if not /sbin/init
 ```
 
-Nesting the renderer under `distro` is what keeps invalid states
-unrepresentable.
-
-Notes per profile:
-
-- **`zpinit`** — zpinit becomes PID 1, which is what its reaper is written for:
-  `internal/reaper/reaper.go` documents "As PID 1 zpinit must reap every child,
-  including orphans reparented to us … after a double-fork," and it does
+- **`zpinit`** — zpinit becomes PID 1, which is what
+  `internal/reaper/reaper.go` is written for: "As PID 1 zpinit must reap every
+  child, including orphans reparented to us … after a double-fork." It does
   **not** set `PR_SET_CHILD_SUBREAPER`. Composed env goes via
   `/run/zpinit/env`, so `entrypoint.d` scripts can extend it.
-- **`command`** — the default for single-process images. vminit stays PID 1,
-  so the workload does not have to call `reboot()` itself to avoid panicking
-  the kernel on exit.
-- **`exec`** — escape hatch and debugging aid. The workload becomes PID 1 with
-  all the obligations that implies. Prefer `command`.
-- **`distro`** — **systemd must be PID 1** (it checks `getpid() == 1` and
-  refuses to run as a system manager otherwise), so `execve` is mandatory here,
-  and vminit must not mount anything.
+- **`command`** — the default for single-process images. vminit stays PID 1
+  and forks the workload. This is strictly better than exec'ing it:
+  - PID 1 does not get default signal dispositions, so a workload exec'd as
+    PID 1 with no `SIGTERM` handler **silently ignores SIGTERM**. Forked, it
+    gets normal semantics with vminit forwarding.
+  - vminit can capture the exit status and report it (§7) before rebooting.
+    Exec'd, nobody can — the VM simply disappears.
+  - orphans get reaped; shutdown does not require the workload to call
+    `reboot()` itself.
 
-### 4.4 Distro renderers — the work really is different per target
+  There is no `exec`-a-bare-command profile, deliberately. It loses on every
+  axis above and gains one saved process.
+- **the generate profiles** — the image ships its own init. See §4.4.
 
-Generating config is not one behaviour. Each target wants a different file in
-a different place, and — the part that is easy to miss — **each also needs its
-consumer enabled**. Writing the file is not enough if the managing service is
-installed but not in a runlevel or wants-directory. vminit cannot run
-`systemctl enable` or `rc-update add`, because neither init is running yet; it
+### 4.4 Generate profiles — for images you build yourself
+
+These are **not** for registry images (§4.6). They are for images you build:
+start from `ubuntu`, `apt install systemd`, add your software, ship a full VM.
+
+systemd and OpenRC own mounts, cgroups and network management. vminit must
+therefore **mount nothing** and configure nothing imperatively — it writes
+files the running system will consume, then execs.
+
+Naming is by **mechanism, not distro**, because the distro does not determine
+the answer: Ubuntu server uses netplan, Debian with systemd usually uses raw
+`systemd-networkd`, Debian classic and Alpine use ifupdown. A `debian` profile
+would be ambiguous, and `systemd` would not tell you whether netplan is in play.
+
+The easy-to-miss part: **writing the file is not enough**. The consuming
+service is often installed but not enabled, and vminit cannot run
+`systemctl enable` or `rc-update add` because neither init is running yet. It
 must create the symlink directly.
 
-| `renderer` | writes | also required |
+| `profile` | writes | also required |
 | --- | --- | --- |
-| `cloud-init` | nothing (see below) | MMDS in EC2 format |
+| `cloud-init` | datasource pin only (below) | MMDS in EC2 format |
 | `netplan` | `/etc/netplan/50-vminit.yaml`, **mode 0600** | nothing; netplan renders to networkd at boot |
 | `systemd-networkd` | `/etc/systemd/network/10-<iface>.network` | symlink `systemd-networkd.service` into `multi-user.target.wants/` — **Debian ships it disabled** |
 | `ifupdown` | `/etc/network/interfaces` | symlink `/etc/init.d/networking` into `/etc/runlevels/boot/` on Alpine |
-| `none` | nothing | kernel `ip=` or in-guest DHCP |
 
-`auto` detects, in order: cloud-init present → `cloud-init`; `/usr/sbin/netplan`
-→ `netplan`; systemd present → `systemd-networkd`; OpenRC present → `ifupdown`;
-otherwise → `none`. Always overridable — detection is a convenience, not a
-contract.
-
-DNS differs too, and does not follow the same split:
+DNS splits differently and does not follow the same lines:
 
 - with systemd-resolved enabled, `/etc/resolv.conf` is a symlink to a stub and
-  direct writes are overwritten — the nameservers must go in `DNS=` in the
-  `.network` file or netplan YAML instead
+  direct writes are overwritten — nameservers must go in `DNS=` in the
+  `.network` file or netplan YAML
 - without resolved (Alpine, minimal Debian), write `/etc/resolv.conf` directly
 
-### 4.5 Prefer cloud-init where it exists
+### 4.5 If you are building the image, just install cloud-init
 
-For cloud images, **the best answer is not to run vminit at all**.
+Since these images are self-built, there is a shortcut that removes most of
+§4.4: **install cloud-init and use `profile = "cloud-init"` for all of them.**
+Packages exist for Alpine as well as Debian and Ubuntu.
 
 MMDS's native schema is already EC2-shaped — that is why Firecracker's own
 examples use `ami-id`, `reservation-id` and `local-hostname` under
 `latest/meta-data`. cloud-init's Ec2 datasource consumes exactly that layout:
 
 ```
-boot /sbin/init directly  +  MMDS populated in EC2 format  =  configured VM
+boot /sbin/init  +  MMDS populated in EC2 format  =  configured VM
 ```
 
-Established pattern; see Sources in docs/RESEARCH.md.
+One mechanism covers every full-distro image regardless of base. Build
+`netplan`, `systemd-networkd` and `ifupdown` only when a specific image cannot
+take cloud-init.
 
-One thing the `cloud-init` renderer should still write, despite the table above
-saying "nothing": pin the datasource, e.g.
+The one file this profile still writes: pin the datasource in
 `/etc/cloud/cloud.cfg.d/90-vminit.cfg` with `datasource_list: [ Ec2, None ]`.
 Without it cloud-init probes every datasource it knows and can add seconds to
 boot.
 
-### 4.6 Where the images actually come from
+### 4.6 Registry images never use the generate profiles
 
-Verified by running `debian:12`, `ubuntu:24.04` and `alpine:3.20`: **none of
-them contain an init system at all** — no systemd, no OpenRC, no netplan, no
+Verified by running `debian:12`, `ubuntu:24.04` and `alpine:3.20`: **none
+contains an init system at all** — no systemd, no OpenRC, no netplan, no
 cloud-init. Container base images strip them.
 
-So `profile = "distro"` does not apply to anything pulled from a registry in
-the normal case. Tier 3 images come from elsewhere — cloud images
-(`.img`/`.qcow2`) or purpose-built VM images. The two paths have different
-image sources entirely, which means autodetection rarely has to make a hard
-call.
+So the generate profiles apply only to images built for this purpose. The two
+paths have disjoint image sources, and `vmpack` should treat "init present in
+an OCI image" as the rare exception it is (`ubi9/ubi-init`, `jrei/systemd-ubuntu`
+and similar) rather than something to probe for on every build.
 
-The exception is the small family of deliberately init-bearing OCI images
-(`registry.access.redhat.com/ubi9/ubi-init`, `jrei/systemd-ubuntu` and
-similar). Detection should still run, but it will almost always say "no init
-present, use an apply profile".
+| Image source | `profile` |
+| --- | --- |
+| OCI, multi-process | `zpinit` |
+| OCI, single process | `command` |
+| Self-built full distro, with cloud-init | `cloud-init` |
+| Self-built full distro, without | `netplan` / `systemd-networkd` / `ifupdown` |
 
-| Tier | Image source | `profile` | Renderer |
-| --- | --- | --- | --- |
-| 1 | OCI, multi-process | `zpinit` | — |
-| 2 | OCI, single process | `command` | — |
-| 3 | Cloud image | `distro` | `cloud-init` |
-| 3b | systemd/OpenRC, no cloud-init | `distro` | `netplan` / `systemd-networkd` / `ifupdown` |
-
-Tiers 1 and 2 are the product. Tier 3 costs almost nothing. Tier 3b is the
-awkward leftover — build renderers there one at a time, driven by real demand.
-
-Set expectations for tier 3 and 3b: a full distro boots in **seconds, not
-milliseconds**, wants a writable rootfs, and realistically needs 256 MB or
-more. Firecracker's fast-boot property does not survive systemd. That is
-inherent, not fixable here.
+The first two are the product. Set expectations for the rest: a full distro
+boots in **seconds, not milliseconds**, wants a writable rootfs, and
+realistically needs 256 MB or more. Firecracker's fast-boot property does not
+survive systemd. That is inherent, not fixable here.
 
 ---
 
@@ -387,15 +384,15 @@ env. Then:
 ### 5.6 Handoff
 
 Per §4.3. Note that §5.1–5.5 run only for the **apply** profiles (`zpinit`,
-`command`, `exec`). For `distro`, vminit skips straight from §5.1 to rendering
-config per §4.4 and then execs — it must not mount anything.
+`command`). For the generate profiles, vminit skips straight from §5.1 to
+rendering config per §4.4 and then execs — it must not mount anything.
 
 For **`zpinit`**, write the composed env to `/run/zpinit/env` in zpinit's
 `key=value` format first — `/run` is a tmpfs mounted in §5.2, so this is cheap
 and disappears on shutdown. Then `execve`. Never `fork`; vminit must not
 linger, and zpinit's reaper is written on the assumption that it is PID 1.
 
-For **`exec`** and **`distro`**, `execve` directly.
+For the **generate profiles**, `execve` `boot.init` directly.
 
 For **`command`**, vminit stays alive as PID 1 and additionally needs:
 
@@ -590,10 +587,10 @@ Not now, but nothing here should be designed against:
   device is MMIO and *is* conditional on `console=`
 - **Snapshots** — restoring N VMs from one snapshot brings duplicate machine
   ids, entropy pools and clocks, vsock UDS collisions, and expected packet loss
-- **Tier 3b** — systemd images with no cloud-init, needing the `generate`
-  renderers (§4.4). Tier 3 proper (cloud images + cloud-init + MMDS) is
-  in scope and nearly free; 3b is the fragile leftover and should wait for a
-  concrete need.
+- **The `netplan`, `systemd-networkd` and `ifupdown` profiles.** The
+  `cloud-init` profile is in scope and nearly free, and §4.5 argues it should
+  cover every self-built distro image. Build the other three one at a time,
+  only when a specific image cannot take cloud-init.
 - **virtio-pmem rootfs** — DAX-mapped, shared host page cache; faster and more
   memory-efficient than virtio-blk for read-only roots. Needs extra kernel config.
 - **squashfs + overlay** rootfs for CoW and cross-VM dedup
@@ -625,11 +622,11 @@ All four test images. This is the real proof of distro independence.
 **M5 — `vminit agent` and MMDS.**
 Live reconfiguration, V2 tokens, persistence across reboot.
 
-**M5b — tier 3, cheap.**
-Boot an Ubuntu cloud image with `profile = "distro"`, `renderer = "cloud-init"`,
-and MMDS populated in EC2 format so cloud-init configures it. No vminit code
-involved beyond not getting in the way — mostly an fcm and MMDS-shaping task,
-which is why it is worth doing early as a validation of §4.5.
+**M5b — the `cloud-init` profile, cheap.**
+Boot a self-built Ubuntu image with `profile = "cloud-init"` and MMDS populated
+in EC2 format. Almost no vminit code beyond writing the datasource pin and
+staying out of the way — mostly an fcm and MMDS-shaping task, which is why it
+is worth doing early as validation of §4.5.
 
 **M6 — production hardening.**
 Jailer, rate limiters, console-off boot args, `serial_out_path`, fcm changes

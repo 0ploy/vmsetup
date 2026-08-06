@@ -290,9 +290,21 @@ mandatory for distro images regardless. Given it is also correct for zpinit,
 one handoff mechanism covering both beats two mechanisms with two shutdown
 paths and two reaping models.
 
-`supervise` mode survives only for the bare-command case, where it solves a
-genuine problem: without it, an unsupervised entrypoint becomes PID 1 and its
-exit panics the kernel unless the workload itself calls `reboot()`.
+The `command` profile survives only for the bare-command case, where forking
+is strictly better than exec'ing. There is deliberately **no** exec-a-bare-
+command profile, because it loses on every axis:
+
+- **PID 1 does not get default signal dispositions.** A workload exec'd as
+  PID 1 with no `SIGTERM` handler silently ignores SIGTERM — the classic
+  Docker footgun. Forked, it gets normal semantics with vminit forwarding.
+- Forked, vminit captures the exit status and can report it before rebooting.
+  Exec'd, nobody can — the VM just disappears.
+- Exec'd, nothing reaps orphans, and the workload must call `reboot()` itself
+  or panic the kernel on exit.
+
+The only thing exec'ing saves is one process. The resulting rule — **exec only
+when the target requires PID 1, otherwise fork** — generates the entire profile
+table on its own.
 
 ### systemd images: generate config, do not apply it
 
@@ -304,6 +316,19 @@ stub, so direct writes get overwritten.
 
 So for systemd targets vminit's job inverts: write configuration files the
 target will read, then exec — never configure imperatively.
+
+The part that is easy to miss is that **writing the file is not enough**. The
+consuming service is frequently installed but not enabled: Debian ships
+`systemd-networkd.service` disabled, and Alpine's `networking` init script is
+not necessarily in a runlevel. vminit cannot run `systemctl enable` or
+`rc-update add`, because neither init is running yet — it has to create the
+symlink directly.
+
+Naming these profiles after the distro would be wrong, because the distro does
+not determine the format. Ubuntu server uses netplan; Debian with systemd
+usually uses raw `systemd-networkd`; Debian classic and Alpine use ifupdown. A
+`debian` profile would be ambiguous and a `systemd` profile would not say
+whether netplan is involved. Name by mechanism.
 
 Better still for the common case: **MMDS is already EC2-shaped.** That is why
 Firecracker's own documentation examples use `ami-id`, `reservation-id` and

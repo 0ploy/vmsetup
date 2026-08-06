@@ -35,30 +35,38 @@ supervisor.
 
 ## Not tied to any one supervisor
 
-One knob decides both what vminit does to the machine and whether it survives
-the handoff — the two are not independent, so exposing them separately would
-only invite combinations that cannot work:
+One flat knob decides both what vminit does to the machine and whether it
+survives the handoff — the two are not independent, so exposing them
+separately would only invite combinations that cannot work:
 
 ```toml
 [boot]
-profile = "zpinit"      # zpinit | command | exec | distro
+profile = "zpinit"   # zpinit | command | cloud-init | netplan | systemd-networkd | ifupdown
 ```
+
+The rule behind the table: **`execve` only when the target requires PID 1;
+otherwise fork.** zpinit requires it, systemd requires it, a bare command
+does not.
 
 | `profile` | config | handoff | PID 1 ends up as |
 | --- | --- | --- | --- |
 | `zpinit` | apply | `execve` | [zpinit](https://github.com/0ploy/zpinit) |
 | `command` | apply | fork + supervise | **vminit** |
-| `exec` | apply | `execve` | the workload |
-| `distro` | generate | `execve` | the image's own init |
+| `cloud-init` | generate | `execve` | the image's own init |
+| `netplan` | generate | `execve` | the image's own init |
+| `systemd-networkd` | generate | `execve` | the image's own init |
+| `ifupdown` | generate | `execve` | the image's own init |
 
-- **`zpinit`** — supervision, entrypoint scripts, readiness probes, restarts
-- **`command`** — single-process images with no supervisor. vminit stays PID 1
-  so the workload need not call `reboot()` itself to avoid panicking the kernel
-- **`exec`** — escape hatch; the workload becomes PID 1 with all that implies
-- **`distro`** — the image ships systemd or OpenRC. Those own mounts, cgroups
-  and networking, so vminit writes config files rather than applying anything.
-  For cloud images, Firecracker's EC2-shaped MMDS plus cloud-init usually
-  removes the need for vminit entirely — see [PLAN.md §4.5](PLAN.md).
+**Apply** profiles are for OCI images: vminit mounts, configures the network
+via netlink, and hands off. **Generate** profiles are for full-distro images
+you build yourself — systemd and OpenRC own mounts, cgroups and networking, so
+vminit writes config files they will consume and touches nothing else.
+
+Generate profiles are named by *mechanism*, not distro, because the distro does
+not determine the answer: Ubuntu server uses netplan, Debian with systemd
+usually uses raw `systemd-networkd`, Alpine uses ifupdown. If you are building
+the image anyway, installing cloud-init and using `cloud-init` covers all of
+them — see [PLAN.md §4.5](PLAN.md).
 
 `vminit` and `zpinit` are designed to work well together, but neither requires
 the other.
