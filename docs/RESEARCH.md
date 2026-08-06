@@ -324,11 +324,37 @@ not necessarily in a runlevel. vminit cannot run `systemctl enable` or
 `rc-update add`, because neither init is running yet — it has to create the
 symlink directly.
 
-Naming these profiles after the distro would be wrong, because the distro does
-not determine the format. Ubuntu server uses netplan; Debian with systemd
-usually uses raw `systemd-networkd`; Debian classic and Alpine use ifupdown. A
-`debian` profile would be ambiguous and a `systemd` profile would not say
-whether netplan is involved. Name by mechanism.
+### Naming the generate profiles: init system, not config format
+
+Two things vary, and they are only partly correlated — the **init system**
+determines how a service gets enabled and what to exec; the **network config
+format** determines which file gets written.
+
+Naming by format breaks, because `ifupdown` spans both init systems. Verified
+by querying the package indexes:
+
+| | Debian 12 | Alpine 3.20 |
+| --- | --- | --- |
+| package | `ifupdown` 0.8.41 | `ifupdown-ng` 0.12.1 |
+| config file | `/etc/network/interfaces` | `/etc/network/interfaces` |
+| managed by | `networking.service` (**systemd** unit) | `/etc/init.d/networking` (**OpenRC**) |
+| enabled by | `multi-user.target.wants/` symlink | `/etc/runlevels/boot/` symlink |
+
+Same filename, different implementations, completely different enablement. A
+profile called `ifupdown` would say which file to write but nothing about how
+to make anything read it.
+
+Naming by distro breaks too: Ubuntu server uses netplan, Debian with systemd
+defaults to ifupdown, Debian cloud images use networkd — `debian` is ambiguous.
+
+The asymmetry that resolves it: **`openrc` fully determines everything**
+(Alpine → ifupdown-ng → runlevel symlink; one combination), while **`systemd`
+leaves the format open** (netplan / networkd / ifupdown). So the profile names
+the init system, with a single `network` sub-option read only under `systemd`.
+
+Note also that the two `ifupdown` implementations are only broadly compatible.
+Write the conservative common subset — plain `iface eth0 inet static` with
+`address` and `gateway` works on both.
 
 Better still for the common case: **MMDS is already EC2-shaped.** That is why
 Firecracker's own documentation examples use `ami-id`, `reservation-id` and

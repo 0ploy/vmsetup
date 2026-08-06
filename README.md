@@ -41,32 +41,35 @@ separately would only invite combinations that cannot work:
 
 ```toml
 [boot]
-profile = "zpinit"   # zpinit | command | cloud-init | netplan | systemd-networkd | ifupdown
+profile = "zpinit"   # zpinit | command | cloud-init | systemd | openrc
 ```
 
-The rule behind the table: **`execve` only when the target requires PID 1;
-otherwise fork.** zpinit requires it, systemd requires it, a bare command
-does not.
+Read it as an answer to one question: **who is going to configure this
+machine's network?**
 
-| `profile` | config | handoff | PID 1 ends up as |
+| `profile` | configured by | vminit's job | handoff |
 | --- | --- | --- | --- |
-| `zpinit` | apply | `execve` | [zpinit](https://github.com/0ploy/zpinit) |
-| `command` | apply | fork + supervise | **vminit** |
-| `cloud-init` | generate | `execve` | the image's own init |
-| `netplan` | generate | `execve` | the image's own init |
-| `systemd-networkd` | generate | `execve` | the image's own init |
-| `ifupdown` | generate | `execve` | the image's own init |
+| `zpinit` | vminit | apply | `execve` [zpinit](https://github.com/0ploy/zpinit) |
+| `command` | vminit | apply | fork + supervise |
+| `cloud-init` | cloud-init | pin the datasource | `execve` init |
+| `systemd` | systemd's network stack | write config + enable it | `execve` init |
+| `openrc` | OpenRC's `networking` service | write config + enable it | `execve` init |
+
+The handoff column follows from one rule: **`execve` only when the target
+requires PID 1; otherwise fork.** zpinit requires it, systemd requires it, a
+bare command does not.
 
 **Apply** profiles are for OCI images: vminit mounts, configures the network
 via netlink, and hands off. **Generate** profiles are for full-distro images
 you build yourself — systemd and OpenRC own mounts, cgroups and networking, so
 vminit writes config files they will consume and touches nothing else.
 
-Generate profiles are named by *mechanism*, not distro, because the distro does
-not determine the answer: Ubuntu server uses netplan, Debian with systemd
-usually uses raw `systemd-networkd`, Alpine uses ifupdown. If you are building
-the image anyway, installing cloud-init and using `cloud-init` covers all of
-them — see [PLAN.md §4.5](PLAN.md).
+Generate profiles are named after the **init system**, because that is what
+determines how a service gets enabled. The config *format* is a separate
+question that only `systemd` leaves open (`network = netplan | systemd-networkd
+| ifupdown`) — `openrc` fully determines it. If you are building the image
+anyway, installing cloud-init sidesteps all of it; see
+[PLAN.md §4.5](PLAN.md).
 
 `vminit` and `zpinit` are designed to work well together, but neither requires
 the other.
