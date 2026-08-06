@@ -501,7 +501,7 @@ and guest memory.
 ```sh
 # production
 init=/sbin/vminit quiet reboot=k panic=1 pci=off nomodules \
-  i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd
+  i8042.noaux i8042.nomux i8042.dumbkbd
 
 # debug
 init=/sbin/vminit console=ttyS0 loglevel=7 reboot=k panic=1 pci=off
@@ -514,13 +514,35 @@ Omitting `console=` stops the *kernel* logging to the emulated UART, which is
 the expensive part — every byte is a synchronous VM exit and the boot log is
 hundreds of lines. It does **not** remove the device: on x86_64 Firecracker
 creates COM1 unconditionally, and the kernel still enumerates `/dev/ttyS0`.
-So userspace logging keeps working with no console spam. See
-docs/RESEARCH.md §4 — **verify this empirically first**, the Firecracker
-swagger doc contradicts the code.
+So userspace logging keeps working with no console spam.
 
-Keep `i8042` itself enabled; the `i8042.*` flags only skip probing. Disabling
-the driver would break `SendCtrlAltDel`, which is the only graceful shutdown
-channel on x86.
+**Verified on hardware 2026-08-06** (Firecracker v1.16.1, guest kernel 6.18.39,
+x86_64) — docs/RESEARCH.md §4.1. The swagger doc that contradicted the code is
+wrong for x86_64; `PUT /serial` with `serial_out_path` delivers guest writes to
+`/dev/ttyS0` with `console=` absent. This section can be built on as written.
+Two refinements from the measurements:
+
+- The saving is **~60-80 ms** to SSH-ready, not the larger number "hundreds of
+  synchronous VM exits" implies (RESEARCH §4.2). Still free, still worth
+  taking — just do not plan around it being bigger.
+- A second, better reason to omit `console=`: with it, systemd claims
+  `/dev/ttyS0` for `serial-getty@ttyS0` and the node is group `tty`. Without
+  it the node is group `dialout` and the port is uncontended, which is what
+  the logging story here actually wants.
+
+`i8042.nopnp` is **deliberately absent** from the production line above, even
+though Firecracker's own `docs/api_requests/actions.md` recommends it. It
+breaks `SendCtrlAltDel` — the i8042 probe fails with `-22`, no keyboard binds,
+`/dev/input/` never appears, and the host loses its only graceful stop.
+Verified by bisecting each flag; see docs/RESEARCH.md §5.1. The failure is
+silent: the VM boots and runs correctly, and nothing looks wrong until you try
+to stop it.
+
+Keep `i8042` itself enabled; the remaining `i8042.*` flags only skip probing.
+Disabling the driver would likewise break `SendCtrlAltDel`, which is the only
+graceful shutdown channel on x86. Note also that none of these flags produced
+a measurable end-to-end boot-time gain (RESEARCH §4.2) — they are kept only
+because they are harmless and conventional.
 
 **Optionally also pass `ip=`** as a belt-and-braces fallback so the VM has
 connectivity even if vminit dies before §5.3:
@@ -610,9 +632,17 @@ Most of this cannot be tested on macOS. Plan for a Linux host with KVM.
   and run their entrypoint. `scratch` is the important one: it proves zero
   guest-userspace dependency.
 - **Shutdown** — `SendCtrlAltDel` results in a clean stop and the Firecracker
-  process exits; assert no `Attempted to kill init` panic.
-- **Boot time** — measure with and without `console=`. Record the numbers; the
-  console claim in §7.2 is load-bearing and currently unverified.
+  process exits; assert no `Attempted to kill init` panic. Confirmed working
+  against stock Ubuntu/systemd on 2026-08-06 (RESEARCH §5.1), which validates
+  the host/kernel half; it still needs re-running against vminit as PID 1,
+  where the SIGINT path of §5.5 is what actually handles the event. **Run this
+  against any change to the `i8042.*` boot args** — `i8042.nopnp` breaks it
+  silently.
+- **Boot time** — measure with and without `console=`. Measure it **from the
+  host** (`InstanceStart` → service reachable): guest-side `systemd-analyze`
+  reported a 476 ms difference that does not exist in host wall clock. Baseline
+  recorded 2026-08-06 in RESEARCH §4.2 — ~1.06 s to SSH-ready without
+  `console=`, ~1.10-1.14 s with, on 2 vCPU / 1024 MiB.
 - **Agent** — `PATCH /mmds` while running, assert the change is applied and
   survives a reboot.
 
@@ -677,10 +707,13 @@ M1 and M2 are the ones that retire the most risk. Everything after is additive.
 
 ## 14. Open questions
 
-1. **Does `/dev/ttyS0` work with `console=` omitted on x86_64?** The code says
-   yes, the swagger doc says no. Settle this on real hardware before §7.2 is
-   built on. If the doc turns out to be right, the log path becomes vsock and
-   `ZPINIT_CHANGES.md` §7 needs revisiting.
+1. ~~**Does `/dev/ttyS0` work with `console=` omitted on x86_64?**~~
+   **Settled 2026-08-06: yes.** The code was right, the swagger doc is wrong
+   for x86_64. `PUT /serial` with `serial_out_path` also works with `console=`
+   absent. §7.2 stands as written and the log path stays on the UART —
+   `ZPINIT_CHANGES.md` §7 needs no revisiting. Evidence in
+   docs/RESEARCH.md §4.1. Fallout: `i8042.nopnp` was dropped from the §7.2
+   production boot args because it breaks `SendCtrlAltDel` (RESEARCH §5.1).
 2. **Rootfs sizing policy** — fixed slack, percentage, or caller-specified?
    Interacts with whether `/data` is a separate volume.
 3. **Does `vmpack` belong in this repo long-term?** Argument for: it writes
