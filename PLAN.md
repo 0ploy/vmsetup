@@ -53,6 +53,13 @@ arbitrary.
    enforces nothing.
 5. **Fail loudly at boot, never silently.** A misconfigured network that boots
    anyway is worse than a VM that refuses to start with a clear message.
+6. **Security and isolation come first.** Performance is taken only where it is
+   harmless to isolation. The workload is untrusted and the VM boundary is the
+   only boundary, so a density or latency win that weakens it is not a win —
+   and vminit sits on the guest side of that boundary, so anything it does with
+   shared state is load-bearing. The host-side reasoning and the rejected
+   options are in [fctl/docs/threat-model.md](../fctl/docs/threat-model.md);
+   the guest-side consequences are §5.2 (overlay root) and §12 (VMGenID).
 
 ---
 
@@ -64,12 +71,13 @@ Firecracker
        └─ vminit boot                      ← PID 1
             1. read build-time config
             2. merge boot-time override, if present
-            3. mount filesystems
-            4. configure network via netlink
-            5. hostname, /etc/hosts, /etc/resolv.conf
-            6. resolve user, compose env
-            7. write /run/zpinit/env (profile=zpinit only)
-            8. execve(profile target)      ← vminit ends here
+            3. assemble overlay root + pivot_root, if configured
+            4. mount filesystems
+            5. configure network via netlink
+            6. hostname, /etc/hosts, /etc/resolv.conf
+            7. resolve user, compose env
+            8. write /run/zpinit/env (profile=zpinit only)
+            9. execve(profile target)      ← vminit ends here
                  └─ zpinit                 ← becomes PID 1
                       ├─ vminit agent      ← supervised as a normal service
                       └─ the workload
@@ -140,6 +148,16 @@ fly's model (`fly-io-init/src/lib.rs:16-33`) and Docker's semantics.
   "mounts": [
     { "device": "/dev/vdc", "path": "/data", "fstype": "ext4", "options": "relatime" }
   ],
+
+  // Optional. When present, vminit assembles an overlay root before anything
+  // else and pivot_roots into it — see §5.2. lower is the shared read-only
+  // image, upper is this VM's private writable layer. fctl attaches both
+  // drives and fills this in; vminit never chooses the layout.
+  "overlay_root": {
+    "lower":  { "device": "/dev/vda", "fstype": "squashfs" },
+    "upper":  { "device": "/dev/vdb", "fstype": "ext4" },   // or "tmpfs"
+    "workdir": "/overlay/work"
+  },
 
   // One flat axis — see §4.3. Decides both what vminit does to the machine
   // and whether it survives the handoff.
@@ -366,6 +384,39 @@ do not replicate fly's cgroup v1 hierarchy; it exists for legacy workloads and
 modern images do not need it.
 
 Then apply `config.mounts` for any extra data volumes.
+
+#### Overlay root, when `overlay_root` is set
+
+This runs **first**, before the table above, because everything else mounts
+into the merged root. Mount the lower read-only, mount the upper, then the
+overlay, then `pivot_root` into it:
+
+```
+mount(lower.device, /overlay/lower, lower.fstype, MS_RDONLY, "")
+mount(upper.device, /overlay/upper, upper.fstype, 0, "")
+mount("overlay", /overlay/merged, "overlay", 0,
+      "lowerdir=/overlay/lower,upperdir=/overlay/upper/root,workdir=...")
+pivot_root(/overlay/merged, ...)
+```
+
+This is the shared-squashfs + per-VM-overlay design from
+[Firecracker discussion #3061][3061] and
+[fctl/docs/performance.md](../fctl/docs/performance.md). It is the main density
+lever available, and it is safe because the shared layer is read-only,
+identity-addressed, and never mapped into the guest — writes land in this VM's
+private upper layer by construction.
+
+**vminit does this itself rather than shipping upstream's `overlay-init`.**
+That is a shell script used as `init=`, which contradicts design principle 3
+(`scratch` images have no shell) and carries a reported failure mode where a
+non-executable script fails the boot with a permission error. A static PID 1
+that already owns mounting has neither problem.
+
+The lower layer must be mounted `MS_RDONLY` and vminit must **fail loudly** if
+it cannot be — a writable shared lower layer is a cross-tenant write channel,
+not a degraded mode to continue in (principle 6).
+
+[3061]: https://github.com/firecracker-microvm/firecracker/discussions/3061
 
 > Docker's export leaves `/etc/resolv.conf`, `/etc/hosts`, `/etc/hostname` as
 > **0-byte regular files** and `/dev/console` as a **0-byte regular file, not a
@@ -640,14 +691,32 @@ These are host-side capabilities tracked in
 [fctl/docs/performance.md](../fctl/docs/performance.md). They are listed here
 only because of what they would do to vminit's design:
 
-- **Snapshots.** Restoring N VMs from one snapshot means duplicate machine ids,
-  entropy pools and clocks, and vsock UDS collisions. If fctl adopts them,
-  vminit's job changes from "configure a fresh machine" to "repair a cloned
-  one" — a different program, so this decision should be made before §5 is
-  built, not after.
-- **virtio-pmem / squashfs+overlay rootfs.** Changes the root device and mount
-  handling in §5.2 (`/dev/pmem0`, `rootflags=dax`). The CI kernel already has
-  `DAX` and `FS_DAX`, so nothing blocks it.
+- **Snapshots, and VMGenID.** Restoring N VMs from one snapshot means duplicate
+  machine ids, entropy pools, RNG seeds, ASLR layouts and pre-snapshot key
+  material, plus vsock UDS collisions. Upstream's position is that resuming the
+  same state more than once is **insecure** without a uniqueness mechanism, and
+  that mechanism is the **VMGenID** device: Firecracker changes a 16-byte
+  identifier and injects an interrupt on every resume (Linux 5.18+, ACPI).
+
+  Detection without reaction buys nothing, and the reaction is **vminit's**:
+  on a VMGenID change, re-seed the RNG and regenerate everything assumed
+  unique — machine-id, SSH host keys, any cached credentials. That is a
+  standing daemon responsibility, not a boot-time one, so it likely belongs in
+  `vminit agent` rather than `vminit boot`.
+
+  This is the case where §5's premise breaks: vminit's job changes from
+  "configure a fresh machine" to "repair a cloned one". Decide before §5 is
+  built, not after. Under principle 6, snapshots stay off until the VMGenID
+  path exists end to end.
+- **virtio-pmem + DAX as the shared lower layer.** Denser than the overlay
+  design now specified in §5.2, because the guest maps host page cache directly
+  instead of copying through the block device — but for the same reason it is
+  weaker, and fctl has it as conditional-only. If adopted it changes the root
+  device and mount handling in §5.2 (`/dev/pmem0`, `rootflags=dax`); the CI
+  kernel already has `DAX` and `FS_DAX`, so nothing blocks it technically.
+  Under principle 6 it needs the density measurement to justify the weaker
+  isolation first. The plain squashfs+overlay form is **no longer deferred** —
+  it is specified in §5.2.
 
 ---
 

@@ -29,6 +29,14 @@ executes one binary as PID 1. Everything else is that binary's problem —
 including the network, because there is no shared namespace for the host to
 reach into. That binary is `vminit`.
 
+## Security first
+
+**Security and isolation come first. Performance is taken only where it is
+harmless to isolation.** The workload is untrusted and the VM boundary is the
+only boundary; vminit sits on the guest side of it. Host-side reasoning and the
+rejected optimisations live in
+[fctl/docs/threat-model.md](../fctl/docs/threat-model.md).
+
 ## Design in one line
 
 ```
