@@ -35,23 +35,30 @@ supervisor.
 
 ## Not tied to any one supervisor
 
-The handoff target is configuration, not policy:
+One knob decides both what vminit does to the machine and whether it survives
+the handoff — the two are not independent, so exposing them separately would
+only invite combinations that cannot work:
 
 ```toml
-[handoff]
-mode = "zpinit"      # or "supervise", "exec", "distro"
+[boot]
+profile = "zpinit"      # zpinit | command | exec | distro
 ```
 
-- `zpinit` — hands off to [zpinit](https://github.com/0ploy/zpinit) for
-  supervision, entrypoint scripts, readiness probes and restarts
-- `supervise` — vminit stays PID 1 and runs the image's entrypoint as a single
-  child, reaping orphans and owning shutdown. For single-process images that
-  want no supervisor.
-- `exec` — executes the entrypoint directly; it becomes PID 1 and must handle
-  that itself. Mainly for debugging.
-- `distro` — the image ships its own init (systemd, OpenRC). vminit steps
-  aside; see [PLAN.md §4.5](PLAN.md), where cloud-init plus Firecracker's
-  EC2-shaped MMDS usually removes the need for vminit entirely.
+| `profile` | config | handoff | PID 1 ends up as |
+| --- | --- | --- | --- |
+| `zpinit` | apply | `execve` | [zpinit](https://github.com/0ploy/zpinit) |
+| `command` | apply | fork + supervise | **vminit** |
+| `exec` | apply | `execve` | the workload |
+| `distro` | generate | `execve` | the image's own init |
+
+- **`zpinit`** — supervision, entrypoint scripts, readiness probes, restarts
+- **`command`** — single-process images with no supervisor. vminit stays PID 1
+  so the workload need not call `reboot()` itself to avoid panicking the kernel
+- **`exec`** — escape hatch; the workload becomes PID 1 with all that implies
+- **`distro`** — the image ships systemd or OpenRC. Those own mounts, cgroups
+  and networking, so vminit writes config files rather than applying anything.
+  For cloud images, Firecracker's EC2-shaped MMDS plus cloud-init usually
+  removes the need for vminit entirely — see [PLAN.md §4.5](PLAN.md).
 
 `vminit` and `zpinit` are designed to work well together, but neither requires
 the other.
