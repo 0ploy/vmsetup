@@ -39,14 +39,19 @@ The handoff target is configuration, not policy:
 
 ```toml
 [handoff]
-mode = "zpinit"      # or "exec", or "custom"
+mode = "zpinit"      # or "supervise", "exec", "distro"
 ```
 
 - `zpinit` — hands off to [zpinit](https://github.com/0ploy/zpinit) for
   supervision, entrypoint scripts, readiness probes and restarts
-- `exec` — executes the image's own entrypoint directly, for single-process
-  images that need no supervision
-- `custom` — executes any binary you name
+- `supervise` — vminit stays PID 1 and runs the image's entrypoint as a single
+  child, reaping orphans and owning shutdown. For single-process images that
+  want no supervisor.
+- `exec` — executes the entrypoint directly; it becomes PID 1 and must handle
+  that itself. Mainly for debugging.
+- `distro` — the image ships its own init (systemd, OpenRC). vminit steps
+  aside; see [PLAN.md §4.5](PLAN.md), where cloud-init plus Firecracker's
+  EC2-shaped MMDS usually removes the need for vminit entirely.
 
 `vminit` and `zpinit` are designed to work well together, but neither requires
 the other.

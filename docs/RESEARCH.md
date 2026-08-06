@@ -269,6 +269,53 @@ What zpinit lacks for VM use is written up in `ZPINIT_CHANGES.md`. The critical
 items are: reboot instead of exit as PID 1, do not `syscall.Exec` in VM mode,
 and handle Ctrl+Alt+Del.
 
+### Why handoff is `execve`, not fork
+
+zpinit does **not** set `PR_SET_CHILD_SUBREAPER` — verified by grep across
+`internal/` and `cmd/`. Its reaper package documents the assumption directly:
+"As PID 1 zpinit must reap every child, including orphans reparented to us from
+anywhere in the container after a double-fork."
+
+If vminit stayed PID 1 and forked zpinit as PID 2, there would be **no reaping
+race** — `wait4(-1)` only reaps a process's own children, and the two
+parent/child sets are disjoint. But orphans from double-forks would reparent to
+vminit rather than zpinit. Nothing breaks functionally, since zpinit has no
+channel registered for untracked orphans anyway. The real cost is that code
+written against a documented "I am PID 1" invariant would run somewhere that
+invariant is false — a latent trap rather than a present bug.
+
+The decisive argument is elsewhere: **systemd must be PID 1.** It checks
+`getpid() == 1` and refuses to run as a system manager otherwise. So `exec` is
+mandatory for distro images regardless. Given it is also correct for zpinit,
+one handoff mechanism covering both beats two mechanisms with two shutdown
+paths and two reaping models.
+
+`supervise` mode survives only for the bare-command case, where it solves a
+genuine problem: without it, an unsupervised entrypoint becomes PID 1 and its
+exit panics the kernel unless the workload itself calls `reboot()`.
+
+### systemd images: generate config, do not apply it
+
+systemd owns mounts, cgroups and network management. It has mount units for
+`/proc`, `/sys`, `/dev`, `/run` and `/sys/fs/cgroup` and expects to own them.
+systemd-networkd with a wildcard match will reconfigure a netlink-configured
+interface. On systemd-resolved systems `/etc/resolv.conf` is a symlink to a
+stub, so direct writes get overwritten.
+
+So for systemd targets vminit's job inverts: write configuration files the
+target will read, then exec — never configure imperatively.
+
+Better still for the common case: **MMDS is already EC2-shaped.** That is why
+Firecracker's own documentation examples use `ami-id`, `reservation-id` and
+`local-hostname` under `latest/meta-data`. cloud-init ships in every cloud
+image and its Ec2 datasource consumes that layout directly, so an Ubuntu cloud
+image needs no vminit at all — boot `/sbin/init`, populate MMDS in EC2 format.
+Established pattern; see the OnGres writeup and `firebuild` in Sources.
+
+Caveat to set expectations with: a systemd VM boots in seconds rather than
+milliseconds, wants a writable rootfs, and realistically needs 256 MB or more.
+Firecracker's fast-boot property does not survive a full distro.
+
 ### Why Go is fine for vminit despite the runtime
 
 vminit `execve`s its handoff target, which **replaces the entire process
@@ -313,3 +360,5 @@ behavior for a container image.
 - [Linux kernel: nfsroot / `ip=` and `/proc/net/pnp`](https://docs.kernel.org/admin-guide/nfs/nfsroot.html)
 - [Weave Ignite](https://github.com/weaveworks/ignite)
 - [firecracker-containerd snapshotter](https://github.com/firecracker-microvm/firecracker-containerd/blob/main/docs/snapshotter.md)
+- [OnGres: running vanilla cloud images on Firecracker](https://ongres.com/blog/automation-to-run-vms-based-on-vanilla-cloud-images-on-firecracker/) — cloud-init + MMDS
+- [firebuild](https://gruchalski.com/posts/2021-03-23-introducing-firebuild/)
