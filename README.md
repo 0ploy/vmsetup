@@ -12,6 +12,11 @@ whatever supervisor the image is meant to run under.
 full design and [docs/RESEARCH.md](docs/RESEARCH.md) for the findings it rests
 on.
 
+`vminit` is the **guest** half. Its host-side counterpart is
+[fctl](../fctl) — the VM manager that owns the Firecracker process, the kernel
+command line, guest kernel builds, networking and snapshots. If a question is
+about what happens before `init=` is exec'd, it belongs there.
+
 ## Why this exists
 
 A container gets an enormous amount for free from its runtime. The runtime

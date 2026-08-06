@@ -8,12 +8,17 @@ Everything here was established on macOS in August 2026 against Firecracker
 running microVM could be tested** — no KVM on macOS. Claims that need
 verification on real hardware are marked **[UNVERIFIED]**.
 
-**Update, 2026-08-06.** §4 has since been verified on real hardware — see
-[§4.1](#41-verified-on-hardware-2026-08-06). Test bed: Linux x86_64 (AMD,
-`kvm_amd`), Firecracker **v1.16.1** release binary, guest kernel **6.18.39**
-and `ubuntu-24.04.squashfs` from the Firecracker CI bucket
-(`firecracker-ci/20260805-f2f43b669a02-0/`), rootfs repacked as ext4. Anything
-still marked **[UNVERIFIED]** below has not been through that test bed.
+> **Scope, since 2026-08-06.** Host-side research now lives in
+> [fctl/docs/RESEARCH.md](../../fctl/docs/RESEARCH.md) — the VMM, the kernel
+> command line, guest kernel builds, serial/console configuration, host-side
+> shutdown mechanics, and boot-time measurement. What remains here is what
+> vminit does *inside* the guest. Several sections below were split on that
+> line and now carry a pointer to their other half.
+>
+> Findings marked **[VERIFIED]** anywhere in this workspace were established on
+> a Linux x86_64 (AMD) host, Firecracker v1.16.1, guest kernel 6.18.39 with the
+> Ubuntu 24.04 CI rootfs — and with **stock systemd as PID 1, not vminit**.
+> That caveat applies to every guest-side conclusion drawn from them.
 
 ---
 
@@ -67,6 +72,10 @@ resolver-compatible.
 
 Useful as belt-and-braces, and essential for future systemd-passthrough mode.
 Not sufficient as the primary mechanism.
+
+Whether `ip=` is actually passed is [fctl](../../fctl)'s decision, since it
+owns the cmdline. vminit must work with or without it, and must not assume the
+interface is already up.
 
 ---
 
@@ -141,221 +150,95 @@ daemon as a build dependency.
 
 ---
 
-## 4. Console, serial, and boot time **[VERIFIED on hardware]**
+## 4. Console and logging — the guest half
 
-Firecracker has **no virtio-console**. The legacy 8250 UART is the only console
-device it emulates — confirmed by the device tree under
-`src/vmm/src/devices/`: `legacy/` contains `i8042.rs`, `rtc_pl031.rs`,
-`serial.rs`, and nothing else console-shaped.
+**Moved.** The console, serial and boot-time research is host-side and now
+lives in [fctl/docs/RESEARCH.md §2](../../fctl/docs/RESEARCH.md) — including
+the verified result that `PUT /serial` works with `console=` absent on x86_64,
+the measured cost of `console=`, and the fact that `serial_out_path` cannot be
+set from a config file.
 
-Every byte written to that UART is a synchronous VM exit. The kernel boot log
-is hundreds of lines, so `console=ttyS0` measurably slows cold boot.
+What matters for vminit, in one paragraph:
 
-### The device exists even without `console=`, on x86_64
+`logging.target = "serial"` (§4.2 of PLAN.md) is sound. On x86_64 Firecracker
+creates COM1 unconditionally, so `/dev/ttyS0` is present and writable from
+guest userspace whether or not `console=` is on the cmdline — **verified**.
+Better still, with `console=` absent no getty claims the port, so vminit has it
+to itself. vminit should therefore open `/dev/ttyS0` directly and never assume
+a console device, and it must tolerate the port being rate-limited by the host
+(Firecracker applies a `TokenBucket`, so writes can be silently dropped —
+do not treat serial as a reliable channel).
 
-`src/vmm/src/device_manager/mod.rs:201-235` — `create_legacy_devices` calls
-`setup_serial_device` **unconditionally** on x86_64, and is itself called
-unconditionally from `DeviceManager::new` (line 241). There is no `console=`
-check on this path.
-
-The `cmdline_contains_console` check at line 364 is in the **aarch64** branch,
-where the serial is an MMIO device that must be advertised on the cmdline.
-
-Reference guest configs set `CONFIG_SERIAL_8250_RUNTIME_UARTS=1`, so the driver
-still enumerates `/dev/ttyS0`.
-
-**Conclusion:** on x86_64 you can drop `console=` for a fast boot and still
-have userspace write to `/dev/ttyS0`.
-
-> The swagger description for `PUT /serial` states it "has no effect if the
-> serial console is not also enabled on the guest kernel command line," which
-> contradicts the above. **The code reading is correct and the swagger text is
-> wrong on x86_64** — see §4.1. The doc appears to be written for the aarch64
-> case, where the serial is MMIO and genuinely is conditional on `console=`.
-
-### 4.1 Verified on hardware (2026-08-06)
-
-Test bed as described at the top of this file. Four VMs, each booted with
-`ip=` networking, then SSH'd into to write a marker string to `/dev/ttyS0`
-from guest userspace:
-
-| # | `console=` | serial sink | marker reached host |
-| --- | --- | --- | --- |
-| 1 | `console=ttyS0` | stdout | yes (460 kernel lines + marker) |
-| 2 | omitted (`quiet`) | stdout | yes (25 lines, marker present) |
-| 3 | **omitted** | `PUT /serial` → file | **yes** — `HTTP 204`, file is exactly the 22-byte marker |
-| 4 | `console=ttyS0` | `PUT /serial` → file | yes — 35 KB, boot log + marker |
-
-Case 3 is the one the swagger text says cannot work. It works. With `console=`
-omitted the guest still reports:
-
-```
-Serial: 8250/16550 driver, 1 ports, IRQ sharing disabled
-00:00: ttyS0 at I/O 0x3f8 (irq = 28, base_baud = 115200) is a 16550A
-```
-
-and `/dev/ttyS0` is present as `4, 64`. Note the device node's group differs —
-`tty` when `console=ttyS0` (systemd has claimed it for a getty), `dialout`
-otherwise. Omitting `console=` therefore also leaves the port *free*, with no
-`serial-getty@ttyS0` competing for it. That is a second reason to omit it,
-independent of speed.
-
-This result depends on the guest kernel building the 8250 driver with
-`CONFIG_SERIAL_8250_RUNTIME_UARTS` ≥ 1, as the Firecracker reference configs
-do. A guest kernel that omits the 8250 driver entirely will not enumerate the
-port no matter what the cmdline says.
-
-### 4.2 Boot-time cost of `console=`, measured
-
-Host wall clock, `InstanceStart` → guest accepting SSH, 5 reps, 2 vCPU /
-1024 MiB:
-
-```
-quiet                                        1.051 1.061 1.062 1.063 1.063
-quiet i8042.nopnp                            1.088 1.063 1.064 1.060 1.063
-quiet nomodules i8042.{noaux,nomux,dumbkbd}  1.074 1.062 1.061 1.062 1.060
-console=ttyS0 loglevel=7                     1.099 1.087 1.116 1.141 1.141
-```
-
-Dropping `console=` is worth roughly **60-80 ms**, and cuts UART traffic from
-460 lines to 25. Real, and free — but a smaller effect than "hundreds of
-synchronous VM exits" suggests, so do not spend design budget buying more of
-it. The `i8042.*` flags buy **nothing** measurable end to end.
-
-Guest-side `systemd-analyze` disagrees loudly — it reports 416 ms total with
-`i8042.nopnp` against 892 ms without, a 476 ms swing that appears in neither
-the host wall clock nor `/proc/uptime` read at SSH-accept (~1.3 s in every
-config). The AT keyboard probe it charges to kernel time is not on the
-critical path to a usable machine. **Measure boot time from the host.**
-
-### Serial output destinations
-
-`SerialOutInner` (`devices/legacy/serial.rs:130-140`) supports `Stdout`,
-`File`, and `Sink`. `PUT /serial` with `serial_out_path` sends guest serial
-output straight to a **per-VM file on the host** — no vsock required for logs.
-
-There is also a `TokenBucket` rate limiter on serial output, which matters for
-untrusted workloads: a chatty guest is throttled, not able to flood the host.
-
-### Boot arg notes
-
-`i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd` saves tens of ms of
-keyboard probing — recommended by Firecracker's own `docs/api_requests/actions.md`.
-Keep the i8042 **driver** enabled though; `SendCtrlAltDel` needs
-`CONFIG_SERIO_I8042` and `CONFIG_KEYBOARD_ATKBD`.
-
-> **Do not pass `i8042.nopnp`.** Verified 2026-08-06: on its own it breaks
-> `SendCtrlAltDel` outright. See §5.1. Firecracker's own docs recommend the
-> full set, so this is a trap worth remembering. The other three flags are
-> safe, and per §4.2 none of them measurably speeds anything up anyway.
-
-Prefer uncompressed `vmlinux` over `bzImage`: decompression costs boot time and
-guest memory.
+One dependency to be aware of: upstream's own performance boot args include
+`8250.nr_uarts=0`, which removes the port entirely. If fctl ever adopts that,
+serial logging dies and the log path has to become vsock.
 
 ---
 
-## 5. Shutdown
+## 5. Shutdown — the guest half
+
+Host-side mechanics (how `SendCtrlAltDel` is delivered, the i8042 dependency,
+and the two ways to lose graceful shutdown silently) are in
+[fctl/docs/RESEARCH.md §3](../../fctl/docs/RESEARCH.md). What vminit must do
+about it:
 
 Firecracker **exits the VMM process on CPU reset**. So a guest terminates its
 own VM by calling `reboot(RB_AUTOBOOT)` — this is what fly does
 (`fly-io-init/src/bin/init/main.rs:879-881`).
 
 Conversely, if PID 1 merely exits, the kernel panics with
-`Attempted to kill init!` and the VM hangs until killed externally.
+`Attempted to kill init!` and the VM hangs until killed externally. **vminit
+must never return from PID 1.** Its terminal action is always a `reboot()`.
 
-Host-initiated graceful shutdown on x86 is the `SendCtrlAltDel` action, which
-emulates an i8042 keyboard event. By default the **kernel** handles that with
-an immediate hard reset. PID 1 must call `reboot(LINUX_REBOOT_CMD_CAD_OFF)` to
-opt out, after which the kernel delivers **SIGINT to PID 1** instead.
+`SendCtrlAltDel` arrives as an i8042 keyboard event. By default the **kernel**
+handles it with an immediate hard reset, which gives the workload no chance to
+flush. PID 1 must call `reboot(LINUX_REBOOT_CMD_CAD_OFF)` at startup to opt
+out, after which the kernel delivers **SIGINT to PID 1** instead — see PLAN.md
+§5.6. That SIGINT path is the half of graceful shutdown this repo owns, and it
+is **untested**: the hardware verification on 2026-08-06 ran against stock
+systemd, not vminit.
 
 There is no ACPI power button. On aarch64 there is no i8042 at all, so a
 future aarch64 port needs a different trigger.
 
-### 5.1 `i8042.nopnp` silently disables graceful shutdown **[VERIFIED]**
-
-`SendCtrlAltDel` injects a key event into the emulated i8042. If the guest
-never binds a keyboard to that controller, the event lands nowhere and the
-host's only graceful stop is gone — the VM can then be ended only by SIGKILL.
-`i8042.nopnp` causes exactly that. Bisected one flag at a time, boot to
-SSH-ready, then `PUT /actions {"action_type":"SendCtrlAltDel"}` and wait 10 s
-for the Firecracker process to exit:
-
-| boot args (plus `quiet`) | VMM exits on CAD |
-| --- | --- |
-| *(none)* | yes |
-| `i8042.noaux` | yes |
-| `i8042.nomux` | yes |
-| **`i8042.nopnp`** | **no** |
-| `i8042.dumbkbd` | yes |
-| `i8042.noaux i8042.nomux i8042.dumbkbd` | yes |
-
-With `nopnp` the guest reports:
-
-```
-i8042: PNP detection disabled
-i8042: Failed to disable AUX port, but continuing anyway... Is this a SiS?
-i8042 i8042: probe with driver i8042 failed with error -22
-```
-
-and `/dev/input/` does not exist at all — no `event0`, no keyboard. Without
-`nopnp` the controller is found via PNP (`PS/2 Controller [PNP0303:PS2] at
-0x60,0x64 irq 29`) and `AT Raw Set 2 keyboard` registers as `input0`.
-
-Note this is a *silent* failure: the VM boots normally and behaves correctly
-in every other respect. Nothing surfaces until the first attempt to stop it
-gracefully. Any boot-arg change in this area needs the shutdown test in
-PLAN.md §11 run against it.
-
-**Graceful shutdown itself is confirmed working** once `nopnp` is dropped.
-Observed over the serial capture with `console=ttyS0`: services stopped,
-`tmp.mount` and `var-lib-systemd.mount` unmounted, `Reached target
-umount.target`, `Reached target reboot.target`, then
-`reboot: Restarting system` and the VMM exits — ~0.3 s end to end, with no
-`Attempted to kill init!`. That was against stock Ubuntu 24.04 systemd, not
-vminit, so it validates the host/kernel half of the path only.
-
 ---
 
-## 6. MMDS
+## 6. MMDS — the guest half
 
-### One network interface is enough
+Host-side configuration (attaching MMDS to `eth0` rather than a dedicated TAP,
+enforcing V2, and the fact that it cannot be added to a VM that booted without
+it) is in [fctl/docs/RESEARCH.md §5](../../fctl/docs/RESEARCH.md). What the
+vminit agent has to deal with:
 
-Firecracker's MMDS user guide attaches MMDS to `eth0` in its own example:
-
-```sh
-MMDS_NET_IF=eth0
-ip route add 169.254.169.254 dev ${MMDS_NET_IF}
-```
-
-Firecracker intercepts packets addressed to the MMDS IP on the configured
-interface and answers them itself; other traffic passes through to the TAP. A
-dedicated MMDS interface is unnecessary — fcm's current second TAP (`mmds0`)
-can be removed.
-
-### Mutability
+### Mutability is the whole point
 
 MMDS is a store inside the Firecracker process. `PUT /mmds` replaces,
 `PATCH /mmds` merges (RFC 7396 JSON Merge Patch) — **at any time, including
-while the VM is running**. That is its unique capability.
-
-What is fixed pre-boot is the *configuration*: which NICs may reach it, the IP,
-and the version. You cannot add MMDS to a VM that booted without it.
-
-There is no push notification. The guest must poll.
+while the VM is running**. That is the only channel that can reconfigure a live
+VM without a reboot, which is why `vminit agent` exists at all.
 
 ### The bootstrapping problem
 
 MMDS is reached *over the network*, but the thing most needed at boot is the
 network configuration. Hence the split in PLAN.md §4.1: boot-critical config
 comes from a file baked into the rootfs; MMDS handles only what must change on
-a live VM.
+a live VM. The agent must therefore never be on the critical path to a working
+network.
 
-### V1 vs V2
+### There is no push notification
 
-V1 is deprecated and unauthenticated — any guest process can read it, including
+The guest polls. This is the origin of the open question in PLAN.md §14 about
+poll interval versus a vsock nudge — and the reason a 30s default is a latency
+floor on every live reconfiguration.
+
+### V2 means the agent does a token dance
+
+V1 is deprecated and unauthenticated: any guest process can read it, including
 via SSRF through the tenant's own application. V2 requires a token obtained
-with `PUT /latest/api/token`. **Use V2.** Note fcm currently omits the
-`version` field, which defaults to V1.
+with `PUT /latest/api/token`, which the agent must fetch, cache, and refresh.
+The agent should **refuse to fall back to V1** even if the host configured it
+that way — that is a misconfiguration worth failing loudly on (design
+principle 5).
 
 ---
 

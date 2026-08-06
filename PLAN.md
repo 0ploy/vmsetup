@@ -22,9 +22,10 @@ arbitrary.
 - Process supervision — that is [zpinit](https://github.com/0ploy/zpinit)'s job
   (see `ZPINIT_CHANGES.md` in the firecracker research workspace for the
   changes zpinit needs)
-- VM lifecycle, TAP devices, host firewall — that is
-  `firecracker-manager` (fcm)
-- Snapshots, live migration, aarch64. Deliberately deferred; see §12.
+- VM lifecycle, TAP devices, host firewall, the kernel command line, guest
+  kernel builds, snapshots — that is [fctl](../fctl), the host-side VM
+  manager. Its research notes are the companion to this document
+- Live migration and aarch64. Deliberately deferred; see §12.
 
 **Target platform:** x86_64 only for now. Linux guest kernel 5.10+.
 
@@ -88,11 +89,11 @@ Three sources, merged in order, each overriding the last:
 | Layer | Location | Written by | When |
 | --- | --- | --- | --- |
 | Build-time defaults | `/etc/vminit/config.json` | `vmpack` | image build |
-| Boot-time override | `/etc/vminit/override.json` | fcm | before each boot |
+| Boot-time override | `/etc/vminit/override.json` | fctl | before each boot |
 | Live updates | MMDS | control plane | while running |
 
 Build-time defaults come from the OCI image config. The boot-time override is
-the `docker run --entrypoint / -e / --user` equivalent — it lets fcm change
+the `docker run --entrypoint / -e / --user` equivalent — it lets fctl change
 per-launch settings without rebuilding the rootfs. MMDS handles what must
 change on a running VM.
 
@@ -391,7 +392,8 @@ Always bring `lo` up. Failing to do so breaks a surprising amount of software.
 
 **One NIC is sufficient for MMDS.** Firecracker's own documentation attaches
 MMDS to `eth0`; a dedicated MMDS interface is unnecessary. fcm currently
-creates a second TAP (`mmds0`) — that should be removed (§10).
+creates a second TAP (`mmds0`) — see
+[fctl/docs/fcm-gap.md](../fctl/docs/fcm-gap.md).
 
 ### 5.4 Identity files
 
@@ -476,80 +478,49 @@ down — a stale config is better than a dead machine.
 
 ---
 
-## 7. Kernel and boot args
+## 7. What vminit needs from the kernel and cmdline
 
-### 7.1 Guest kernel
+**The guest kernel and the kernel command line belong to [fctl](../fctl).**
+Console handling in particular is a host-side runtime flag, never a property of
+the image. The authoritative documents are
+[fctl/docs/guest-kernel.md](../fctl/docs/guest-kernel.md) and
+[fctl/docs/booting-vms.md](../fctl/docs/booting-vms.md); this section states
+only what vminit *depends* on, so that a change over there which breaks vminit
+is recognisable as such.
 
-Start from Firecracker's reference config
-(`resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config`). Verified
-present and required:
+### 7.1 Kernel options vminit relies on
 
 ```
-CONFIG_IP_PNP=y                 # kernel-level ip= fallback
 CONFIG_VIRTIO_BLK=y  CONFIG_VIRTIO_NET=y  CONFIG_VIRTIO_MMIO=y
-CONFIG_EXT4_FS=y  CONFIG_DEVTMPFS=y
-CONFIG_VSOCKETS=y  CONFIG_VIRTIO_VSOCKETS=y     # for later host-side exec
-CONFIG_SERIO_I8042=y  CONFIG_KEYBOARD_ATKBD=y   # required for SendCtrlAltDel
+CONFIG_EXT4_FS=y  CONFIG_DEVTMPFS=y     # §5.2 mounts assume devtmpfs
+CONFIG_IP_PNP=y                         # only for the ip= fallback below
 CONFIG_SERIAL_8250=y  CONFIG_SERIAL_8250_RUNTIME_UARTS=1
+                                        # logging target = serial, §4.2
+CONFIG_SERIO_I8042=y  CONFIG_KEYBOARD_ATKBD=y
+                                        # §5.6 SIGINT handoff needs CAD to arrive
+CONFIG_VSOCKETS=y  CONFIG_VIRTIO_VSOCKETS=y   # only if host-side exec lands
 ```
 
-Use uncompressed **`vmlinux`**, not `bzImage` — decompression costs boot time
-and guest memory.
+> The i8042 pair is **not** in the checked-in `guest_configs/*.config` files —
+> it comes from `ci.config`, which the build script concatenates on top. Build
+> from the base config alone and `SendCtrlAltDel` silently stops working, which
+> takes the §5.6 SIGINT path with it. See
+> [fctl/docs/guest-kernel.md §1](../fctl/docs/guest-kernel.md).
 
-### 7.2 Boot args
+### 7.2 Cmdline vminit assumes
 
-```sh
-# production
-init=/sbin/vminit quiet reboot=k panic=1 pci=off nomodules \
-  i8042.noaux i8042.nomux i8042.dumbkbd
-
-# debug
-init=/sbin/vminit console=ttyS0 loglevel=7 reboot=k panic=1 pci=off
-```
-
-Console handling must be a **runtime flag on the host side**, not a build-time
-property of the image.
-
-Omitting `console=` stops the *kernel* logging to the emulated UART, which is
-the expensive part — every byte is a synchronous VM exit and the boot log is
-hundreds of lines. It does **not** remove the device: on x86_64 Firecracker
-creates COM1 unconditionally, and the kernel still enumerates `/dev/ttyS0`.
-So userspace logging keeps working with no console spam.
-
-**Verified on hardware 2026-08-06** (Firecracker v1.16.1, guest kernel 6.18.39,
-x86_64) — docs/RESEARCH.md §4.1. The swagger doc that contradicted the code is
-wrong for x86_64; `PUT /serial` with `serial_out_path` delivers guest writes to
-`/dev/ttyS0` with `console=` absent. This section can be built on as written.
-Two refinements from the measurements:
-
-- The saving is **~60-80 ms** to SSH-ready, not the larger number "hundreds of
-  synchronous VM exits" implies (RESEARCH §4.2). Still free, still worth
-  taking — just do not plan around it being bigger.
-- A second, better reason to omit `console=`: with it, systemd claims
-  `/dev/ttyS0` for `serial-getty@ttyS0` and the node is group `tty`. Without
-  it the node is group `dialout` and the port is uncontended, which is what
-  the logging story here actually wants.
-
-`i8042.nopnp` is **deliberately absent** from the production line above, even
-though Firecracker's own `docs/api_requests/actions.md` recommends it. It
-breaks `SendCtrlAltDel` — the i8042 probe fails with `-22`, no keyboard binds,
-`/dev/input/` never appears, and the host loses its only graceful stop.
-Verified by bisecting each flag; see docs/RESEARCH.md §5.1. The failure is
-silent: the VM boots and runs correctly, and nothing looks wrong until you try
-to stop it.
-
-Keep `i8042` itself enabled; the remaining `i8042.*` flags only skip probing.
-Disabling the driver would likewise break `SendCtrlAltDel`, which is the only
-graceful shutdown channel on x86. Note also that none of these flags produced
-a measurable end-to-end boot-time gain (RESEARCH §4.2) — they are kept only
-because they are harmless and conventional.
-
-**Optionally also pass `ip=`** as a belt-and-braces fallback so the VM has
-connectivity even if vminit dies before §5.3:
-
-```
-ip=172.16.0.2::172.16.0.1:255.255.255.252::eth0:off
-```
+- **`init=/sbin/vminit`** — obviously.
+- **No `console=` in production.** vminit logs to `/dev/ttyS0` directly, and
+  the port is enumerated with or without it on x86_64 (verified). Without
+  `console=` the port is also uncontended by a getty, which is what the logging
+  design wants.
+- **`reboot=k`** — vminit's reboot path (§5.6) relies on a guest reset exiting
+  the VMM.
+- **Never `i8042.nopnp`** — it breaks `SendCtrlAltDel`, and with it vminit's
+  only graceful-shutdown signal.
+- **`ip=…` is optional** but recommended, as belt-and-braces connectivity if
+  vminit dies before §5.3. IPv4 only, one interface, and it does not write
+  `/etc/resolv.conf` — DNS lands in `/proc/net/pnp`.
 
 ---
 
@@ -593,29 +564,32 @@ kernel state. Therefore:
 
 - **The VM boundary is the only boundary.** A tenant replacing `/sbin/vminit`
   is expected and harmless.
-- **All limits are host-enforced**: vCPU and memory by Firecracker, disk and
-  network throughput by Firecracker's rate limiters, traffic policy by
-  nftables on the TAP, process isolation by the **jailer** plus seccomp.
-- Run Firecracker under the **jailer** — see the upstream
-  `docs/prod-host-setup.md`.
+- **All limits are host-enforced** — vCPU, memory, disk and network
+  throughput, traffic policy, jailer, seccomp. **vminit enforces nothing**, and
+  none of it is vminit's to configure. See
+  [fctl/docs/](../fctl/docs/) for how the host side does it.
 - **MMDS V2 only.** V1 is unauthenticated; any process in the guest, including
-  one reached via SSRF in the tenant's own app, can read it.
-- Firecracker rate-limits serial output via a `TokenBucket`, so a guest cannot
-  flood the host through the log channel. Confirm it is configured.
+  one reached via SSRF in the tenant's own app, can read it. vminit's agent
+  must therefore do the token dance (§6) and should refuse to fall back to V1
+  even if the host misconfigures it.
 
 ---
 
-## 10. Host-side changes in `firecracker-manager`
+## 10. What vminit needs from the host
 
-| Change | Where | Why |
+vminit's host-side requirements — boot args, `/etc/vminit/override.json`
+placement, MMDS shape and version, graceful stop, serial log destination — are
+owned and tracked by [fctl](../fctl). The gap list against the existing
+`firecracker-manager` lives in
+[fctl/docs/fcm-gap.md](../fctl/docs/fcm-gap.md).
+
+The contract is three items wide, and vminit owns the schema of two of them:
+
+| Interface | Owner of the mechanism | Owner of the schema |
 | --- | --- | --- |
-| Drop the `mmds0` TAP; attach MMDS to `eth0` | `lib/vm_lifecycle.py:113-135`, `lib/network_manager.py:144` | One NIC suffices; removes a device to create, track and leak |
-| Make boot args configurable, with prod/debug profiles | `lib/firecracker_api.py:65` | Currently hardcoded `console=ttyS0 reboot=k panic=1 pci=off` |
-| Set `serial_out_path` via `PUT /serial` | `lib/firecracker_api.py` | Per-VM log file on the host, no vsock needed |
-| Enforce MMDS `version: "V2"` | `lib/firecracker_api.py:109` | Currently defaults to deprecated V1 |
-| Write `/etc/vminit/override.json` before boot | `lib/filesystem_manager.py` | Per-launch config without rebuilding the rootfs |
-| Graceful stop via `SendCtrlAltDel`, not SIGKILL | `lib/vm_lifecycle.py` | Lets the guest flush and unmount |
-| Run under jailer | `lib/vm_lifecycle.py` | Untrusted workloads |
+| Kernel cmdline | fctl | fctl (§7 states what vminit assumes) |
+| `/etc/vminit/override.json` | fctl writes it pre-boot | vminit (§4.2) |
+| MMDS contents | fctl populates it | vminit (§4.2, §6) |
 
 ---
 
@@ -631,18 +605,16 @@ Most of this cannot be tested on macOS. Plan for a Linux host with KVM.
 - **Boot matrix** — the same four images must boot, get an IP, resolve DNS,
   and run their entrypoint. `scratch` is the important one: it proves zero
   guest-userspace dependency.
-- **Shutdown** — `SendCtrlAltDel` results in a clean stop and the Firecracker
-  process exits; assert no `Attempted to kill init` panic. Confirmed working
-  against stock Ubuntu/systemd on 2026-08-06 (RESEARCH §5.1), which validates
-  the host/kernel half; it still needs re-running against vminit as PID 1,
-  where the SIGINT path of §5.5 is what actually handles the event. **Run this
-  against any change to the `i8042.*` boot args** — `i8042.nopnp` breaks it
-  silently.
-- **Boot time** — measure with and without `console=`. Measure it **from the
-  host** (`InstanceStart` → service reachable): guest-side `systemd-analyze`
-  reported a 476 ms difference that does not exist in host wall clock. Baseline
-  recorded 2026-08-06 in RESEARCH §4.2 — ~1.06 s to SSH-ready without
-  `console=`, ~1.10-1.14 s with, on 2 vCPU / 1024 MiB.
+- **Shutdown** — `SendCtrlAltDel` reaches vminit as SIGINT (§5.6), which stops
+  the workload and reboots; assert no `Attempted to kill init` panic. The
+  host/kernel half of this path is already confirmed against stock systemd
+  ([fctl RESEARCH §3](../fctl/docs/RESEARCH.md)); what remains untested is
+  vminit as PID 1, which is the half this repo owns.
+- **Boot time** — measure **from the host**, never with in-guest tooling; see
+  [fctl/docs/performance.md](../fctl/docs/performance.md) for the baseline and
+  why the guest's own clock lies during early boot. vminit's contribution to
+  cold start is the interval from `init=` exec to handoff, which it should
+  report itself by signalling Firecracker's boot-timer device.
 - **Agent** — `PATCH /mmds` while running, assert the change is applied and
   survives a reboot.
 
@@ -654,17 +626,28 @@ Not now, but nothing here should be designed against:
 
 - **aarch64** — no i8042, so shutdown needs a different trigger; the serial
   device is MMIO and *is* conditional on `console=`
-- **Snapshots** — restoring N VMs from one snapshot brings duplicate machine
-  ids, entropy pools and clocks, vsock UDS collisions, and expected packet loss
 - **The `systemd` and `openrc` generate profiles.** The `cloud-init` profile
   is in scope and nearly free, and §4.5 argues it should cover every
   self-built distro image. Build these two — and the three `network` variants
   under `systemd` — only when a specific image cannot take cloud-init.
-- **virtio-pmem rootfs** — DAX-mapped, shared host page cache; faster and more
-  memory-efficient than virtio-blk for read-only roots. Needs extra kernel config.
-- **squashfs + overlay** rootfs for CoW and cross-VM dedup
 - **Host-side `exec`** — needs `zpctl exec` and a vsock listener; see
-  `ZPINIT_CHANGES.md` §9 and §6
+  `ZPINIT_CHANGES.md` §9 and §6. Note vsock is the one device that crosses the
+  VM boundary, so it is a security decision as much as a feature.
+
+### Deferred to fctl, but with consequences here
+
+These are host-side capabilities tracked in
+[fctl/docs/performance.md](../fctl/docs/performance.md). They are listed here
+only because of what they would do to vminit's design:
+
+- **Snapshots.** Restoring N VMs from one snapshot means duplicate machine ids,
+  entropy pools and clocks, and vsock UDS collisions. If fctl adopts them,
+  vminit's job changes from "configure a fresh machine" to "repair a cloned
+  one" — a different program, so this decision should be made before §5 is
+  built, not after.
+- **virtio-pmem / squashfs+overlay rootfs.** Changes the root device and mount
+  handling in §5.2 (`/dev/pmem0`, `rootflags=dax`). The CI kernel already has
+  `DAX` and `FS_DAX`, so nothing blocks it.
 
 ---
 
@@ -694,12 +677,12 @@ Live reconfiguration, V2 tokens, persistence across reboot.
 **M5b — the `cloud-init` profile, cheap.**
 Boot a self-built Ubuntu image with `profile = "cloud-init"` and MMDS populated
 in EC2 format. Almost no vminit code beyond writing the datasource pin and
-staying out of the way — mostly an fcm and MMDS-shaping task, which is why it
+staying out of the way — mostly an fctl and MMDS-shaping task, which is why it
 is worth doing early as validation of §4.5.
 
 **M6 — production hardening.**
-Jailer, rate limiters, console-off boot args, `serial_out_path`, fcm changes
-from §10.
+Jailer, rate limiters, console-off boot args, `serial_out_path` — all of it
+now tracked in [fctl](../fctl), see §10.
 
 M1 and M2 are the ones that retire the most risk. Everything after is additive.
 
@@ -710,15 +693,21 @@ M1 and M2 are the ones that retire the most risk. Everything after is additive.
 1. ~~**Does `/dev/ttyS0` work with `console=` omitted on x86_64?**~~
    **Settled 2026-08-06: yes.** The code was right, the swagger doc is wrong
    for x86_64. `PUT /serial` with `serial_out_path` also works with `console=`
-   absent. §7.2 stands as written and the log path stays on the UART —
-   `ZPINIT_CHANGES.md` §7 needs no revisiting. Evidence in
-   docs/RESEARCH.md §4.1. Fallout: `i8042.nopnp` was dropped from the §7.2
-   production boot args because it breaks `SendCtrlAltDel` (RESEARCH §5.1).
+   absent, so `logging.target = "serial"` stands and the log path stays on the
+   UART — `ZPINIT_CHANGES.md` §7 needs no revisiting. Evidence, now host-side,
+   in [fctl/docs/RESEARCH.md §2](../fctl/docs/RESEARCH.md). Fallout:
+   `i8042.nopnp` must never appear in the boot args, because it breaks
+   `SendCtrlAltDel` and with it vminit's SIGINT shutdown path
+   ([fctl RESEARCH §3.1](../fctl/docs/RESEARCH.md)).
 2. **Rootfs sizing policy** — fixed slack, percentage, or caller-specified?
    Interacts with whether `/data` is a separate volume.
-3. **Does `vmpack` belong in this repo long-term?** Argument for: it writes
-   the schema `vminit` reads, and drift between them is the likeliest bug.
-   Argument against: it is host-side and may end up inside fcm.
+3. **Does `vmpack` belong in this repo long-term?** Sharpened now that
+   [fctl](../fctl) exists: `vmpack` is host-side tooling, which is fctl's
+   half of the world, and fctl is what will invoke it. Argument for keeping it
+   here anyway: it writes the config schema `vminit` reads, and drift between
+   the writer and the reader is the likeliest bug in the whole design. Left
+   here for now on that basis — the co-location *is* the mitigation. Revisit
+   when fctl has a shape.
 4. **Agent poll interval, or push?** Polling MMDS every 30s is simple but
    laggy. A vsock nudge from the host would be immediate — but that is the
    same vsock work as host-side exec, so it may come for free later.
