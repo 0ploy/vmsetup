@@ -3,14 +3,23 @@
 Written 2026-08-11 from `fctl/`, against `fctl/PLAN.md` as it stands after the
 pre-implementation review. This is the fctl side asking the vminit side for
 decisions on the **interfaces the two projects meet at** — which have moved
-since vminit's plan was written, mostly because the shared squashfs + per-VM
-overlay design changed what is possible.
+since vminit's plan was written, mostly because the rootfs design changed.
+
+**Updated 2026-08-12.** The storage design was re-measured end to end and
+changed materially: there is no longer a shared squashfs. Every VM now gets its
+own reflinked copy of a plain ext4 image, attached read-only over **virtio-pmem
+and mounted with DAX**, plus a private writable upper on virtio-blk, merged with
+overlayfs exactly as before. §2, §3 and §5 are rewritten accordingly; the
+numbers behind it are in
+[fctl/test/results/bench-storage-2026-08-11.md](../fctl/test/results/bench-storage-2026-08-11.md)
+and [fctl/docs/RESEARCH.md §8](../fctl/docs/RESEARCH.md). The overlay itself
+survives, for a different reason than before — see §3.
 
 It is meant to be implementable directly, in a session working from `vminit/`.
 Where it proposes a contract, it gives the exact format and the exact fields.
 
 Nothing here blocks vminit from continuing. But §1, §2, §3 and §5 all follow
-from the shared-lower design, and fctl's M2 hardens the rootfs creation path —
+from the rootfs design, and fctl's M2 hardens the creation path —
 so answers before then avoid a retrofit.
 
 Each section states what fctl needs, why, what fctl does in the meantime, and
@@ -22,9 +31,9 @@ side quietly assume. Two of these — §1 and §6 — make vminit *smaller*.
 | --- | --- | --- | --- |
 | 1 | **The config path: one document, raw bytes on a block device, no filesystem.** `/etc/vminit/{config,override}.json` both deleted | vminit (schema + boot order) | fctl M2 creation path |
 | 2 | Overlay `workdir` must live inside the upper filesystem | vminit (§4.2 example is wrong) | correctness, guest-side |
-| 3 | The overlay root arrives mounted `ro`, not `rw` | vminit (§5.2 doc claim) | nothing, but the doc misleads |
+| **3** | **The lower is `/dev/pmem0`, mounted `ro,dax` — not a `/dev/vd*` drive.** Device letters shift | **vminit (§4.2, §5.2)** | **correctness, guest-side** |
 | 4 | A shutdown-intent sentinel on `/dev/ttyS0` | vminit (§5.6 shutdown path) | fctl restart classification |
-| 5 | `vmpack` emits squashfs + a manifest, and the manifest becomes the **authoritative** image config | vminit (`vmpack` is yours) | fctl M4; §5.1 is coupled to §1 |
+| 5 | `vmpack` emits a plain ext4 image + a manifest, and the manifest becomes the **authoritative** image config | vminit (`vmpack` is yours) | fctl M4; §5.1 is coupled to §1 |
 | **6** | **vminit stays PID 1 — never `execve`s. It owns `exec` over vsock, and rescue mode** | **vminit** | **`fctl exec`, M5** |
 | 7 | `ip=` is gone entirely; every VM has one interface | vminit (§7.2 wording) | nothing, but the doc is now wrong |
 | **8** | **The profile axis disappears.** Distro images are no longer vminit's concern | **vminit (schema)** | nothing — pure deletion |
@@ -95,7 +104,7 @@ offset 16   JSON document      NUL-padded to the end of the device
   that ceiling host-side, so the guest never meets a truncated document.
 - vminit: open the device, read 16 bytes, check the magic, check the version,
   read `length` bytes, `json.Unmarshal`. That is the entire config path.
-- `head -c 4096 /dev/vdb` shows you the config after the header. Arguably more
+- `head -c 4096 /dev/vda` shows you the config after the header. Arguably more
   inspectable than a filesystem, and it satisfies the "a human with `cat` can
   answer what this is" principle both projects hold.
 
@@ -113,26 +122,27 @@ begin bringup, so a bringup failure still leaves an inspectable machine.
 ### 1.4 Finding the device — no scanning
 
 Every *other* device is simply named in the document: it says the lower is
-`/dev/vda`, the upper `/dev/vdc`, volume `data` is `/dev/vdd`. fctl composes it
+`/dev/pmem0`, the upper `/dev/vdb`, volume `data` is `/dev/vdc`. fctl composes it
 knowing exactly which `PUT` order it used, so it is self-consistent by
 construction. **The config device is the only one that has to be found**, since
 it is the one thing that cannot be named in the file it contains.
 
 Three independent things fix it, and vminit should require all three to agree:
 
-1. **Position — always the first non-root drive.** Firecracker's
-   `BlockBuilder::insert` `push_front`s the root device and `push_back`s the
-   rest in `PUT` order. fctl issues the config blob first among the non-root
-   drives, so it is `/dev/vdb` in both storage modes:
+1. **Position — always the first drive.** Firecracker's `BlockBuilder::insert`
+   `push_front`s a root *block* device and `push_back`s the rest in `PUT` order.
+   The root device is now on virtio-pmem (§3), so there is no block device to
+   push to the front and drives are named purely in `PUT` order. fctl issues the
+   config blob first, so:
 
-   `vda` is the squashfs (the root device, `push_front`ed), `vdb` the config,
-   `vdc` the overlay, `vdd`+ named volumes. Volumes append after and cannot
-   disturb it.
+   `/dev/vda` is the config, `/dev/vdb` the upper, `/dev/vdc`+ named volumes.
+   The lower is `/dev/pmem0`, a separate namespace that cannot collide.
 
-2. **Pointer — `vminit_config=/dev/vdb` on the kernel command line.** fctl knows
-   what it attached, so vminit derives nothing. This is the authoritative one:
-   it survives a future virtio-pmem root, where there is no root *block* device
-   and the letters shift.
+2. **Pointer — `vminit_config=/dev/vda` on the kernel command line.** fctl knows
+   what it attached, so vminit derives nothing. This is the authoritative one,
+   and note it is exactly why it exists: the earlier draft of this document
+   predicted that a future virtio-pmem root would shift the letters. It has, and
+   only the pointer needed changing.
 
    Two notes. Reading it means mounting `/proc` before the config read — a
    trivial reorder, `/proc` depends on nothing. And **there is deliberately no
@@ -179,8 +189,8 @@ has:
 
 ```jsonc
 "overlay_root": {
-  "lower":  { "device": "/dev/vda", "fstype": "squashfs" },
-  "upper":  { "device": "/dev/vdc", "fstype": "ext4" },   // vdb is the config blob, §1.4
+  "lower":  { "device": "/dev/pmem0", "fstype": "ext4", "options": "ro,dax" },
+  "upper":  { "device": "/dev/vdb", "fstype": "ext4" },   // vda is the config blob, §1.4
   "workdir": "/overlay/work"
 }
 ```
@@ -212,51 +222,69 @@ in the config. There is no version of this where vminit has to guess.
 
 ---
 
-## 3. In overlay mode the kernel's root arrives `ro`, and the squashfs is `/dev/vda` by construction
+## 3. The lower is `/dev/pmem0`, mounted `ro,dax` — and `dax` is load-bearing
 
-Two corrections to statements in your plan, both consequences of a bug fctl
-found in its own §10.2 during review. No action needed beyond the doc fix, but
-you should know the mechanism, because your §5.2 currently reasons from the
-opposite premise.
+This section changed completely on 2026-08-12. The shape is the same as before —
+read-only lower, writable upper, overlayfs, `pivot_root` — but the lower is no
+longer a squashfs on a virtio-blk drive.
 
-**fctl's error was to specify `is_root_device: false` on both drives**, on the
-theory that the real root is the overlay vminit assembles. That does not boot.
-Firecracker emits `root=` *only* for a drive flagged as root —
-`attach_block_devices` calls `append_root_device_cmdline` under
-`if locked.root_device()` (`src/vmm/src/builder.rs`,
-`src/vmm/src/vmm_config/boot_source.rs`). With neither drive flagged and no
-`initrd_path`, the kernel has no root filesystem, panics at
-`VFS: Unable to mount root fs`, and never reaches `init=`. Now corrected: the
-**squashfs lower is the kernel's root device**, the kernel execs `/sbin/vminit`
-out of it, and vminit assembles the overlay from there — the same shape as
-upstream's `overlay-init`, minus the shell.
+### 3.1 What it is now
 
-Two things follow for vminit:
+Each VM gets its **own** reflinked copy of a plain ext4 image, attached over
+**virtio-pmem** with `root_device: true, read_only: true`. Firecracker emits
+`root=/dev/pmem0 ro` from those two fields (`attach_pmem_devices`,
+`src/vmm/src/builder.rs`), and fctl adds `rootflags=dax` to the command line.
+The kernel mounts it, execs `/sbin/vminit` out of it, and vminit assembles the
+overlay from there — same as before, different device.
 
-- **`root=/dev/vda ro`, not `rw`.** The same function appends `ro` when the root
-  drive is `is_read_only: true`, which a shared squashfs always is. Your §5.2
-  says *"it appends `root=/dev/vda rw` by itself [VERIFIED]"* — that
-  verification was on the writable-ext4 path and holds only for
-  `mode: "writable"`. In overlay mode the initial root is read-only and cannot
-  be remounted `rw` (squashfs), so the "check and remount `/`" step will fail
-  there. Your existing behaviour is already correct — failure to remount is a
-  warning, not an abort, and everything in §5.4 writes after the pivot into the
-  writable overlay — but the doc's stated reason is wrong and worth fixing
-  before someone relies on it.
-- **Device naming is now guaranteed, not conventional.**
-  `BlockBuilder::insert` (`src/vmm/src/vmm_config/drive.rs`) `push_front`s the
-  root device and appends the rest in `PUT` order. Flagging the squashfs is what
-  makes it `vda`; fctl issuing the config blob first among the non-root drives
-  is what makes *that* `vdb` (§1.4). The overlay lands at **`vdc`**, and named
-  volumes at `vdd`+.
+Three things vminit must get right:
 
-  Previously your `overlay_root` naming `/dev/vda` and fctl's `PUT` order agreed
-  by luck. They now agree by construction — and note that with §1 the whole
-  question mostly dissolves, because fctl composes the document and names in it
-  whatever devices it actually attached. Only the config device itself needs
-  finding.
+- **Mount the lower `-o ro,dax`.** Not `defaults`. Not `ro` alone.
+- **`dax` is not a tuning flag, it is the whole point.** Without it the guest
+  builds its own page cache for every image read, and per-VM pinned host memory
+  goes from ~82 MB to ~448 MB — measured, at 16 VMs. There is no error, no log
+  line and no symptom other than density collapsing at scale. Please assert it:
+  after mounting, check `/proc/mounts` for `dax=always` on the lower and log
+  loudly if it is absent.
+- **`ro` matters for a reason that is not obvious.** Upstream documents that on
+  x86_64 a guest write to a read-only pmem device is decoded by KVM, handed back
+  to Firecracker as an MMIO write, and **discarded with a log line** — the guest
+  is *not* faulted. The host file is safe either way, but without `-o ro` a
+  guest-side bug that writes the lower fails silently instead of getting
+  `EROFS`.
 
----
+### 3.2 The `ro` root correction still stands
+
+Your PLAN §5.2 says *"it appends `root=/dev/vda rw` by itself [VERIFIED]"*. That
+verification was on the writable-single-ext4 path. In the overlay design the
+initial root is read-only, so the "check and remount `/` rw" step will fail
+there. Your existing behaviour is already correct — failure to remount is a
+warning, not an abort, and everything in §5.4 writes after the pivot into the
+writable overlay — but the doc's stated reason is wrong and the device name in
+it is now wrong too.
+
+### 3.3 Why the overlay survives at all — worth knowing before you simplify it
+
+The original reason for an overlay was to stop N VMs writing to **one shared**
+read-only image. That reason is gone: every VM now has its own copy, so the
+image could simply be writable and the overlay, the `pivot_root` and the
+`upperdir`/`workdir` contract could all be deleted.
+
+fctl measured that before proposing it, and it is a trap. A writable DAX root is
+**19x slower on small-file writes** (164 MB/s against 3205), costs 2.4x the host
+CPU, and fragments the image from 5 extents to 1188 — destroying the reflink
+sharing it was created with. DAX has no guest page cache to coalesce scattered
+writes, so every 4 KiB store becomes a fault. Source trees, package installs and
+`apt` are the worst possible shape for it.
+
+So the overlay's job is now a different one:
+
+> It routes **reads** to the DAX lower and **writes** to the virtio-blk upper,
+> because DAX's entire benefit is on reads and its entire cost is on writes.
+
+With the split, guest writes run at 81–99% of raw virtio-blk speed and the lower
+stays pristine. If a future change makes the overlay look redundant, this is the
+paragraph to re-read first.
 
 ## 4. A shutdown-intent sentinel on `/dev/ttyS0`
 
@@ -300,23 +328,31 @@ is where the line goes.
 
 ---
 
-## 5. `vmpack` must emit squashfs, plus a manifest
+## 5. `vmpack` emits a plain ext4 image, plus a manifest
 
-Your PLAN §8 step 6 specifies `truncate` + `mkfs.ext4 -d <tree>` — a single
-writable ext4 rootfs. In fctl's model that is `mode: "writable"`: supported,
-needed for full-distro images, invaluable for debugging, and **not** the density
-path. The shared-lower design needs a **squashfs** artifact, which is the thing
-that makes one image cost one page-cache copy across every VM booted from it.
+**Good news: your PLAN §8 step 6 is already right.** It specifies `truncate` +
+`mkfs.ext4 -d <tree>`, and that is exactly what fctl now wants — a plain,
+uncompressed ext4 image. An earlier draft of this document asked for squashfs
+instead; that ask is **withdrawn**. DAX cannot map compressed blocks, and
+squashfs separately measured ~15% more host CPU per GiB read than ext4, with
+zstd compression coming out *free* relative to uncompressed squashfs — the cost
+was the driver, not the compressor
+([fctl RESEARCH.md §8.6](../fctl/docs/RESEARCH.md)).
 
-**The ask, in fctl's order of need:**
+The only change to the artifact itself is how it is *used*: fctl reflinks a
+per-VM copy and attaches it read-only as the overlay's lower (§3). `vmpack` does
+not need to know that.
 
-1. `vmpack` produces `rootfs.squashfs` as the default output for registry
-   images, with `rootfs.ext4` retained as an explicit `--writable` mode.
-2. It emits a **manifest** alongside — fctl stores it at
+**What is still asked:**
+
+1. It emits a **manifest** alongside — fctl stores it at
    `images/<digest>/manifest.json` and will not import an artifact without one.
-3. Determinism as already stated in your §8 (same image digest + same vminit
-   version ⇒ byte-identical output) matters more for squashfs than for ext4,
-   because it is what lets fctl content-address the shared artifact.
+2. Determinism as already stated in your §8 (same image digest + same vminit
+   version ⇒ byte-identical output), which is what lets fctl content-address the
+   image.
+3. Size the image for the guest's expected disk, since the image size is what
+   the guest sees. Sparse is fine and expected — reflink plus sparseness means
+   an unwritten image costs nearly nothing per VM.
 
 ### 5.1 §1 promotes the manifest, and that changes step 5 of your pipeline
 
@@ -331,9 +367,10 @@ Concretely, your PLAN §8 step 5 ("Inject") loses one bullet:
   manifest instead. Everything else injected stays: `/sbin/vminit`, zpinit and
   `zpctl` under the `zpinit` profile, and the generated zpinit service TOMLs.
 
-fctl deliberately does **not** read inside the rootfs to get this. Mounting a
-squashfs as root, or shelling to `unsquashfs`, on every `fctl create` is worse
-than reading a JSON file sitting next to it.
+fctl deliberately does **not** read inside the rootfs to get this. Loop-mounting
+an ext4 as root on every `fctl create` is privileged, racy, and puts a parser for
+untrusted filesystem metadata in the control plane — all worse than reading a
+JSON file sitting next to it.
 
 **One rule on the manifest's contents, and it matters.** Your §8 step 7 has the
 manifest carrying *"the recommended boot args"*. **fctl will never read those.**
@@ -354,8 +391,8 @@ spec for reproducibility — "this VM was created from exactly this manifest" �
 not as a security control. Real artifact integrity belongs to the image registry
 that will eventually sit in front of all this.
 
-**Timing:** fctl needs squashfs output for M4 (artifact stores and tenancy), not
-M2 — M2 can boot a hand-built squashfs. But **§5.1 is coupled to §1**: the
+**Timing:** fctl needs the manifest for M4, not M2 — M2 can boot a hand-built
+image. But **§5.1 is coupled to §1**: the
 moment `vmpack` stops writing `/etc/vminit/config.json`, the manifest has to
 carry the config. Land them together.
 
@@ -556,10 +593,10 @@ not to build it in v1, nothing in fctl depends on it.
 
 ### 8.5 The one thing this forecloses
 
-A fleet of identical distro VMs sharing one squashfs would be a real density
-win, and it needs something to assemble the overlay before systemd starts — i.e.
-vminit with an empty bringup and an `execve` handoff, which is exactly what is
-being deleted.
+A fleet of identical distro VMs with a DAX lower would recover the memory saving
+the overlay design gets, and it needs something to assemble the overlay before
+systemd starts — i.e. vminit with an empty bringup and an `execve` handoff, which
+is exactly what is being deleted.
 
 If that requirement ever appears it comes back as a minimal bringup mode, added
 for a concrete case with a concrete shape. It is additive to the schema, so
@@ -621,10 +658,12 @@ out of §1, §6 and §8. The list, so nothing is missed:
 | §4.1, §4.2 | The three-layer merge and both config files go (§1). `overlay_root.workdir` moves inside the upper mount (§2) |
 | §4.3–§4.6 | The profile table, the `network` sub-knob, the generate profiles and the cloud-init argument all go (§8) |
 | §5.1 | Config comes from a block device, read before anything is mounted (§1.3) |
-| §5.2 | The `[VERIFIED]` claim that Firecracker appends `root=/dev/vda rw` holds only for a writable rootfs; in overlay mode it is `ro` (§3) |
+| §4.2 | `overlay_root.lower` becomes `/dev/pmem0` with `options: "ro,dax"`; `upper` becomes `/dev/vdb` (§3.1) |
+| §5.2 | The `[VERIFIED]` claim that Firecracker appends `root=/dev/vda rw` holds only for a writable rootfs; the root is now `/dev/pmem0` and arrives `ro` (§3.2) |
+| §5.3 | The lower mount must carry `dax` and be asserted after mounting — silent to lose, 5x the pinned memory per VM (§3.1) |
 | §5.6 | "Never `fork`" inverts — vminit always forks and stays PID 1 (§6.1). The `command` lifecycle becomes the only lifecycle |
 | §7.2 | `ip=` is never emitted; drop the debug-NIC clause (§7) |
-| §8 | `vmpack` emits squashfs plus a manifest, stops writing `/etc/vminit/config.json` (§5) |
+| §8 | Step 6 stays as written (plain ext4 — the squashfs ask is **withdrawn**). Step 5 stops writing `/etc/vminit/config.json`; step 7's manifest becomes authoritative (§5) |
 | §12, §13 | Deferred generate profiles and the M3/M5 milestones that reference zpinit VM-mode work |
 | §14 Q4 | Answered by vminit owning `exec` (§6.2) |
 
@@ -638,13 +677,23 @@ it at lines 23, 610, 846, 899, 905, 911 and 939, and `docs/RESEARCH.md` at line
 ## Where the fctl side stands
 
 `fctl/PLAN.md` is the spec and now reflects all of the above; the sections that
-reference this document are §6.4, §8.2, §9.3, §9.6, §10.2, §14.3 and §15. fctl
+reference this document are §6.4, §8.2, §9.5, §9.7, §10.2, §11.6 and §15. fctl
 is pre-implementation, starting at M-1 (a throwaway spike that boots one VM
 through its own API client) and then M0.
 
-The two documents to read alongside this one are **fctl PLAN §9.6** (the config
-path, of which §1 here is the implementable form) and **§14.3** (exec and the
-connect-only vsock policy, of which §6 here is the implementable form).
+Three documents to read alongside this one:
+
+- **fctl PLAN §9** — the whole storage design, rewritten 2026-08-12. §9.2 and
+  §9.4 are the ones that explain why the overlay is still there.
+- **fctl PLAN §9.7** — the config path, of which §1 here is the implementable
+  form.
+- **fctl PLAN §11.6** — exec and the connect-only vsock policy, of which §6 here
+  is the implementable form.
+
+The measurements behind the storage change are in
+[fctl/docs/RESEARCH.md §8](../fctl/docs/RESEARCH.md), with raw output and
+harnesses in `fctl/test/results/` and `fctl/test/bench/`. Nothing in §3 is
+reasoned from first principles; all of it was run on real hardware.
 
 `ZPINIT_CHANGES.md` is gone, replaced by `zpinit/HANDOVER.md` in that repo. The
 entire VM-mode feature and the vsock listener are withdrawn; `zpctl exec`
