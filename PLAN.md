@@ -355,6 +355,22 @@ survive systemd. That is inherent, not fixable here.
 Ordered steps. Each must be idempotent where possible and log its failure
 clearly to the console before aborting.
 
+> **Implemented ordering differs in one place, deliberately.** devtmpfs is
+> mounted on `/dev` *before* the config is read, not after. "Log its failure
+> clearly to the console" is not achievable otherwise: a rootfs exported from
+> an OCI image contains no device nodes, so until devtmpfs is up there is no
+> `/dev/ttyS0` to log to, and reading the config is the step most likely to
+> fail. Nothing about mounting `/dev` depends on the config, so the reordering
+> costs nothing. Everything logged before the port opens is buffered and
+> flushed the moment it does. [VERIFIED] — a truncated `override.json` reports
+> `override config is not a JSON object` on the host's serial log and the VM
+> reboots without a kernel panic.
+>
+> The consequence for §5.2's overlay root, whenever it is built: `/dev` is
+> already mounted by then, so it must be `MS_MOVE`d into the merged root
+> rather than mounted again, the way
+> `fly-io-init/src/bin/init/main.rs:214` does it.
+
 ### 5.1 Read config
 
 Open `/etc/vminit/config.json`; merge `/etc/vminit/override.json` if present.
@@ -384,6 +400,30 @@ do not replicate fly's cgroup v1 hierarchy; it exists for legacy workloads and
 modern images do not need it.
 
 Then apply `config.mounts` for any extra data volumes.
+
+#### `EBUSY` on `/dev` is the normal case, not an edge case
+
+The reference guest kernel sets `CONFIG_DEVTMPFS_MOUNT=y`, so **the kernel has
+already mounted devtmpfs on `/dev` before it execs `init=`** — and it does so
+with none of the flags in the table above. Mounting it again returns `EBUSY`.
+
+Treating that as "already done, carry on" silently loses `nosuid` on `/dev`.
+[VERIFIED] — the boot test caught exactly this. So `EBUSY` means adopt the
+existing mount and apply the flags to it with
+`MS_REMOUNT|MS_BIND`, which changes the per-mount flags without touching the
+superblock. The distinction matters for devtmpfs specifically, which is one
+kernel-wide instance rather than one filesystem per mount.
+
+#### Remounting `/` read-write
+
+The kernel mounts the root filesystem read-only unless `rw` is on the command
+line, and everything in §5.4 writes to `/etc`. vminit therefore checks and
+remounts if needed, which is belt-and-braces rather than load-bearing on
+Firecracker: it **appends `root=/dev/vda rw` to the boot args by itself**
+[VERIFIED], so `/` arrives writable even when the caller's `boot_args` say
+nothing about it. Failing to remount is a warning, not an abort — the
+subsequent write failure names the file it could not write, which is a more
+useful message than one about mount flags.
 
 #### Overlay root, when `overlay_root` is set
 
@@ -436,8 +476,50 @@ For each configured interface:
    whenever there is more than one interface.
 2. `LinkSetUp`
 3. `AddrAdd` the address
-4. `RouteAdd` the default route via `gateway`
+4. `RouteAdd` the default route via `gateway`, **with `RTNH_F_ONLINK` when the
+   address does not cover the gateway** — see below
 5. If `mmds: true`, `RouteAdd` a host route to the MMDS address on this link
+
+#### The default route needs `onlink` under a /32 **[VERIFIED]**
+
+fctl allocates each VM **one routed address with no on-link subnet at all** —
+a bare `/32` whose gateway is a link-local address that every tap on the host
+carries ([fctl RESEARCH.md §7](../fctl/docs/RESEARCH.md)). One address per VM
+instead of the four a `/30` burns, and the gateway is then identical for every
+VM everywhere, so the guest's configuration no longer depends on which address
+it was allocated.
+
+The consequence here is small but absolute: with a `/32` the gateway is inside
+no connected prefix, so a plain route add fails and the VM boots with no
+default route. Verified, by disabling the flag and re-running the boot test:
+
+```
+[vminit   11.992ms] configured eth0 with 10.77.0.5/32
+[vminit   12.659ms] error: bringup failed: interface eth0: add default route
+                    via 169.254.0.1 on eth0: network is unreachable
+```
+
+`RTNH_F_ONLINK` tells the kernel to treat the nexthop as directly reachable,
+which it genuinely is — the tap is point-to-point with the host at the other
+end.
+
+**The flag is computed, not configured.** `netconf.gatewayNeedsOnlink` sets it
+only when the interface's own address really does not contain the gateway.
+Two reasons for deriving it rather than adding a schema field:
+
+- a field would be one more thing fctl and vminit can disagree about, and
+  drift between the writer and the reader of this schema is the likeliest bug
+  in the whole design;
+- setting `onlink` unconditionally would be worse than either. On a
+  conventional subnet a mistyped gateway currently fails at route-add time,
+  loudly, which is principle 5. With the flag always on it would install a
+  route that silently blackholes instead.
+
+Alternatives that also work but were not taken: an explicit link-scope `/32`
+route to the gateway before the default route (one extra route, same effect),
+and a gateway-less default route on the device, which additionally requires
+`proxy_arp` on the host tap and makes the guest ARP for every off-host
+destination. Both are measured in fctl RESEARCH.md §7.
 
 Always bring `lo` up. Failing to do so breaks a surprising amount of software.
 
@@ -483,6 +565,34 @@ For **`zpinit`**, write the composed env to `/run/zpinit/env` in zpinit's
 `key=value` format first — `/run` is a tmpfs mounted in §5.2, so this is cheap
 and disappears on shutdown. Then `execve`. Never `fork`; vminit must not
 linger, and zpinit's reaper is written on the assumption that it is PID 1.
+
+The composed env additionally travels in **`envp`**, and that is the primary
+channel of the two. Three reasons, all found while implementing:
+
+- `envp` *is* zpinit's "container env" tier — the same tier `docker run -e`
+  and Dockerfile `ENV` land in — which is precisely what image env is. Routing
+  it only through the env file would place it in the `entrypoint.d` tier
+  instead, above the operator's `[env]` globals in `zpinit.toml`.
+- the env file is line-based (`internal/entrypoint/entrypoint.go`), so it
+  cannot represent a value containing a newline. Such a variable is skipped
+  from the file with a warning and reaches zpinit through `envp` regardless,
+  rather than silently corrupting every line after it.
+- the file still earns its place: it is what makes the composed env visible to
+  `entrypoint.d` scripts, and what they append to in order to hand variables
+  forward. It is written mode `0600`, because image env routinely carries
+  credentials and everything that legitimately reads it runs as root.
+
+**`boot.args` is not defaulted**, despite `["--vm"]` being the right production
+value. zpinit releases before VM mode exists reject unknown flags, so injecting
+the flag would turn a working boot into a failing one. `vmpack` writes it;
+vminit warns at boot when it is absent, because the symptom otherwise appears
+much later as a kernel panic at shutdown with nothing pointing at the cause.
+
+**PID 1's stdio has to be set up before the handoff.** Production boots without
+`console=` (§7.2), so the kernel may hand init closed descriptors — and a child
+inheriting a closed fd 1 gets it assigned to the first file it opens. zpinit
+logs to `os.Stderr`, so without this its output is simply lost. vminit points
+fd 0 at `/dev/null` and fds 1 and 2 at the log target before exec'ing.
 
 For the **generate profiles**, `execve` `boot.init` directly.
 
@@ -569,9 +679,24 @@ CONFIG_VSOCKETS=y  CONFIG_VIRTIO_VSOCKETS=y   # only if host-side exec lands
   the VMM.
 - **Never `i8042.nopnp`** — it breaks `SendCtrlAltDel`, and with it vminit's
   only graceful-shutdown signal.
-- **`ip=…` is optional** but recommended, as belt-and-braces connectivity if
-  vminit dies before §5.3. IPv4 only, one interface, and it does not write
-  `/etc/resolv.conf` — DNS lands in `/proc/net/pnp`.
+- **`ip=…` is optional**, and under the routed `/32` model it is not merely
+  optional but impossible. The kernel's `ipconfig` initialises its netmask to
+  `INADDR_NONE`, which is bit-for-bit `255.255.255.255`, so **a `/32` netmask
+  is indistinguishable from "unset"**: it silently guesses a classful mask and
+  then rejects the gateway as off-link. Verified —
+  [fctl RESEARCH.md §7](../fctl/docs/RESEARCH.md). fctl therefore omits it from
+  production boot args and restores the belt-and-braces property with a
+  debug-only second NIC on a private `/30`. Where `ip=` does still apply
+  (that debug NIC, or a conventional subnet) it is IPv4 only, one interface,
+  and it does not write `/etc/resolv.conf` — DNS lands in `/proc/net/pnp`.
+  Leaving it off the real interface is also what makes the boot test's
+  connectivity check meaningful: with `ip=` the guest would reach the host
+  whether or not §5.3 works at all.
+- **`root=` and `rw` do not need to be passed.** Firecracker appends
+  `root=/dev/vda rw` itself, after whatever `boot_args` the caller supplied
+  [VERIFIED] — a guest booted with `boot_args` of only
+  `reboot=k panic=1 pci=off init=/sbin/vminit` sees both in `/proc/cmdline`.
+  vminit still checks and remounts (§5.2), because this is fctl's to change.
 
 ---
 
@@ -647,6 +772,42 @@ The contract is three items wide, and vminit owns the schema of two of them:
 ## 11. Testing
 
 Most of this cannot be tested on macOS. Plan for a Linux host with KVM.
+
+`test/run.sh` is the harness: it builds a fixture rootfs per scenario, boots it
+under Firecracker, and has an in-guest probe check the resulting machine
+against the expectations. The fixture generates the vminit config *and* the
+probe's expectations from one set of shell variables, so the two cannot drift.
+It stands in for `vmpack` until `vmpack` exists, and the rootfs it produces is
+deliberately `scratch`-like: three static Go binaries, no shell, no libc.
+
+Three scenarios pass on real hardware [VERIFIED]:
+
+| scenario | proves |
+| --- | --- |
+| `base` | the full §5.2–§5.6 path and the zpinit handoff, from `config.json` alone |
+| `override` | the §4.1 merge on a running machine: `hostname` and `user_override` replaced, `extra_env` merged per variable, the network and image untouched by an override that mentions neither |
+| `routed32` | fctl's routed-address model end to end: a bare `/32` with no on-link subnet, a link-local gateway shared by every tap, and the `RTNH_F_ONLINK` default route that makes it work (§5.3) |
+
+`routed32` earns its place by failing without the flag rather than by passing
+with it; the negative control is quoted in §5.3. The end-to-end HTTP fetch is
+what detects the difference, because a guest with an address but no default
+route still passes every check that only reads local state.
+
+`build-rootfs.sh` writes `test/net.env` and `boot.sh` sources it, so the TAP
+the host configures comes from the same variables as the guest's expectations.
+That extends the fixture's existing anti-drift property to the host side,
+which the `/32` scenario needs because it differs in the *shape* of the host
+setup and not merely in the numbers.
+
+The probe checks the mount table *and its flags*, the `/dev` symlinks, the
+identity files, the address and default route, env precedence, `HOME`/`TERM`
+defaulting, `/run/zpinit/env` and its mode, the resolved uid/gid, that PID 1 is
+zpinit and the workload is not, and an HTTP fetch of a host listener bound to
+the TAP address — which is the end-to-end proof that netlink configuration
+worked, since the boot args deliberately carry no `ip=`.
+
+Guest-visible boot arrives at the probe's report ~0.74s after the Firecracker
+process starts, of which vminit's own bringup is 14-28ms.
 
 - **Unit** — config merge precedence, OCI→zpinit TOML translation, env
   composition order, user resolution incl. numeric ids and missing `/etc/passwd`.
@@ -732,10 +893,22 @@ Mounts, netlink, identity files, user resolution, env composition, handoff in
 `nginx:alpine` boots, serves traffic, resolves DNS, and stops cleanly on
 `SendCtrlAltDel`.
 
-**M3 — zpinit handoff.**
+**M3 — zpinit handoff.** *(bringup and handoff done; shutdown blocked on
+zpinit)*
 `profile = "zpinit"`, generated service TOML, `/run/zpinit/env`. Requires
 zpinit sections 1, 2, 4 and 5 from `ZPINIT_CHANGES.md`. Success = a
 multi-process image with restarts and readiness probes.
+
+The vminit half is built and verified against zpinit v0.5.5: full bringup,
+`/run/zpinit/env`, `execve`, and zpinit supervising the workload as PID 1 with
+the composed environment. What is left needs the zpinit side. Until
+`ZPINIT_CHANGES.md` §1 and §2 land, zpinit runs in container mode, so a service
+that exits takes PID 1 with it and panics the kernel — the boot test works
+around it by holding the workload open, and `SendCtrlAltDel` still hard-resets
+the VM because nobody has called `CAD_OFF`. vminit deliberately does not call
+it on this path: that would deliver SIGINT to a zpinit that treats it as
+"exit", which is worse than the hard reset. It stays zpinit's, per
+`ZPINIT_CHANGES.md` §5a.
 
 **M4 — `scratch` and the boot matrix.**
 All four test images. This is the real proof of distro independence.
@@ -777,6 +950,30 @@ M1 and M2 are the ones that retire the most risk. Everything after is additive.
    the writer and the reader is the likeliest bug in the whole design. Left
    here for now on that basis — the co-location *is* the mitigation. Revisit
    when fctl has a shape.
-4. **Agent poll interval, or push?** Polling MMDS every 30s is simple but
+4. **How does `user_override` reach the workload under `profile = "zpinit"`?**
+   Found while implementing §5.5. Under this profile vminit never `setuid`s —
+   it execs zpinit as root, and the uid the workload runs as comes from `user`
+   in the service TOML, which `vmpack` baked in at image build time. So a
+   per-launch `user_override` currently changes only the composed environment
+   (`HOME`), not the uid: the `docker run --user` equivalent is silently
+   half-applied.
+
+   Three candidate answers, none obviously right yet:
+
+   - vminit writes a zpinit drop-in under `/etc/zpinit/services/` overriding
+     `user`. Cheap, but puts knowledge of zpinit's config schema in vminit,
+     which so far only `vmpack` has.
+   - `vmpack` emits `user` as something zpinit resolves at run time from the
+     env vminit composes. Needs a zpinit feature and interpolation in configs,
+     which zpinit's `CLAUDE.md` lists as a non-goal.
+   - declare `user_override` unsupported for this profile and reject it at
+     merge time, which at least fails loudly instead of half-working.
+
+   The same question applies to `exec_override` and `working_dir`, which live
+   in the baked TOML for exactly the same reason. Note it does **not** arise
+   for `profile = "command"`, where vminit forks the workload itself and can
+   apply all three directly. Decide before `vmpack` generates service files.
+
+5. **Agent poll interval, or push?** Polling MMDS every 30s is simple but
    laggy. A vsock nudge from the host would be immediate — but that is the
    same vsock work as host-side exec, so it may come for free later.

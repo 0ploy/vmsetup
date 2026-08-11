@@ -13,3 +13,9 @@ CODE_REVIEW*.md
 *.ext4
 *.squashfs
 /rootfs/
+
+# Boot-test artifacts (test/run.sh rebuilds all of these)
+/test/bin/
+/test/rootfs/
+/test/serial*.log
+/test/build-*.log

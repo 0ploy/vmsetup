@@ -8,9 +8,19 @@ for you — mounting filesystems, configuring the network from the inside,
 setting the hostname, writing `/etc/resolv.conf` — and then hands off to
 whatever supervisor the image is meant to run under.
 
-**Status: planning.** No implementation yet. See [PLAN.md](PLAN.md) for the
-full design and [docs/RESEARCH.md](docs/RESEARCH.md) for the findings it rests
-on.
+**Status: early implementation.** `vminit boot` performs full bringup and hands
+off to [zpinit](https://github.com/0ploy/zpinit), verified on real hardware:
+`test/run.sh` boots a `scratch`-like rootfs under Firecracker and checks the
+resulting machine from the inside. The other four profiles, `vminit agent` and
+`vmpack` are not built yet, and refuse loudly rather than half-working. See
+[PLAN.md](PLAN.md) for the full design and [docs/RESEARCH.md](docs/RESEARCH.md)
+for the findings it rests on.
+
+```
+go build ./cmd/vminit     # CGO_ENABLED=0; static, no libc
+go test ./...             # unit tests, no KVM needed
+sudo ./test/run.sh        # boot matrix; needs KVM, firecracker, mkfs.ext4
+```
 
 `vminit` is the **guest** half. Its host-side counterpart is
 [fctl](../fctl) — the VM manager that owns the Firecracker process, the kernel
@@ -87,13 +97,19 @@ anyway, installing cloud-init sidesteps all of it; see
 `vminit` and `zpinit` are designed to work well together, but neither requires
 the other.
 
-## Repository layout (planned)
+## Repository layout
 
 | Path | Role |
 | --- | --- |
 | `cmd/vminit` | Guest-side binary: `boot` and `agent` subcommands |
-| `cmd/vmpack` | Host-side packer: OCI image → bootable ext4 rootfs |
+| `cmd/vmpack` | Host-side packer: OCI image → bootable ext4 rootfs *(not built yet)* |
 | `internal/config` | Shared config schema — the reason both binaries live here |
+| `internal/mounts` | The filesystem hierarchy |
+| `internal/netconf` | Network configuration over netlink |
+| `internal/identity` | Hostname, `/etc/hosts`, `/etc/resolv.conf` |
+| `internal/userenv` | User resolution and env composition |
+| `internal/vmlog` | The console log, buffered until `/dev/ttyS0` exists |
+| `test/` | Boot matrix: fixture rootfs builder, Firecracker harness, in-guest probe |
 
 `vmpack` writes the config that `vminit` reads. Keeping them in one repo is
 what stops the schema from drifting.
