@@ -29,7 +29,8 @@ side quietly assume. Two of these — §1 and §6 — make vminit *smaller*.
 | 7 | `ip=` is gone entirely; every VM has one interface | vminit (§7.2 wording) | nothing, but the doc is now wrong |
 | **8** | **The profile axis disappears.** Distro images are no longer vminit's concern | **vminit (schema)** | nothing — pure deletion |
 
-**§6 and §8 are the big ones.** Together they remove `ZPINIT_CHANGES.md` §1–§5
+**§6 and §8 are the big ones.** Together they remove five of the six changes
+zpinit was going to need
 and most of vminit PLAN §4.
 
 ---
@@ -395,7 +396,8 @@ specifies for `profile = "command"`. That path becomes the only path.
 Two reapers in one tree do not fight: a process has exactly one parent, so
 `wait4(-1)` in vminit and in zpinit operate on disjoint sets by construction.
 
-**This deletes `ZPINIT_CHANGES.md` §1–§5** — the entire VM-mode feature. zpinit
+**This deletes the entire VM-mode feature zpinit was going to need** — see
+`zpinit/HANDOVER.md`. zpinit
 runs in container mode, unmodified. §4 is the nicest: `execCmd` at
 `main.go:371` replaces zpinit's image with the app, fatal when zpinit is PID 1
 and harmless when it is a grandchild of vminit.
@@ -609,6 +611,30 @@ a surprise.
 
 ---
 
+## What in `vminit/PLAN.md` this touches
+
+Not rewritten here — that is the vminit session's to do, and most of it falls
+out of §1, §6 and §8. The list, so nothing is missed:
+
+| Where | What |
+| --- | --- |
+| §4.1, §4.2 | The three-layer merge and both config files go (§1). `overlay_root.workdir` moves inside the upper mount (§2) |
+| §4.3–§4.6 | The profile table, the `network` sub-knob, the generate profiles and the cloud-init argument all go (§8) |
+| §5.1 | Config comes from a block device, read before anything is mounted (§1.3) |
+| §5.2 | The `[VERIFIED]` claim that Firecracker appends `root=/dev/vda rw` holds only for a writable rootfs; in overlay mode it is `ro` (§3) |
+| §5.6 | "Never `fork`" inverts — vminit always forks and stays PID 1 (§6.1). The `command` lifecycle becomes the only lifecycle |
+| §7.2 | `ip=` is never emitted; drop the debug-NIC clause (§7) |
+| §8 | `vmpack` emits squashfs plus a manifest, stops writing `/etc/vminit/config.json` (§5) |
+| §12, §13 | Deferred generate profiles and the M3/M5 milestones that reference zpinit VM-mode work |
+| §14 Q4 | Answered by vminit owning `exec` (§6.2) |
+
+Also **`ZPINIT_CHANGES.md` no longer exists** — it moved into the zpinit repo as
+`zpinit/HANDOVER.md`, with most of its contents withdrawn. `PLAN.md` references
+it at lines 23, 610, 846, 899, 905, 911 and 939, and `docs/RESEARCH.md` at line
+262; all are now dangling.
+
+---
+
 ## Where the fctl side stands
 
 `fctl/PLAN.md` is the spec and now reflects all of the above; the sections that
@@ -620,10 +646,11 @@ The two documents to read alongside this one are **fctl PLAN §9.6** (the config
 path, of which §1 here is the implementable form) and **§14.3** (exec and the
 connect-only vsock policy, of which §6 here is the implementable form).
 
-`ZPINIT_CHANGES.md` §1–§5 and §6 are gone — the entire VM-mode feature and the
-vsock listener. §9 (`zpctl exec`) remains only as a container feature. What is
-left for that session is one line: the not-PID-1 warning at
-`cmd/zpinit/main.go:79` now fires on every VM boot and is misleading.
+`ZPINIT_CHANGES.md` is gone, replaced by `zpinit/HANDOVER.md` in that repo. The
+entire VM-mode feature and the vsock listener are withdrawn; `zpctl exec`
+survives only as a container feature. What is left in the guest is one line —
+the not-PID-1 warning at `cmd/zpinit/main.go:79`, which now fires on every VM
+boot and is misleading.
 
 Reply in whatever form suits — edits to `vminit/PLAN.md` with a note here, or a
 section appended to this file. What fctl needs is the decision recorded
