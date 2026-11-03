@@ -1,13 +1,15 @@
-// Command vmprobe is the test payload for the boot matrix. It runs as an
-// ordinary zpinit service inside the guest and checks, from the inside, that
-// vminit actually did what PLAN.md §5 says it does.
+// Command vmprobe is the test payload for the boot matrix. It runs inside the
+// guest -- as a zpinit service, or as zpinit's wrap-mode command -- and
+// checks, from the inside, that vmsetup actually did what PLAN.md §5 says.
 //
 // Everything it needs to know about the expected machine arrives on the
-// command line, so test/build-rootfs.sh can generate the vminit config and
+// command line, so test/build-rootfs.sh can generate the guest config and
 // this invocation from one set of values and the two cannot drift.
 //
-// Output goes to stdout, which zpinit forwards to the console and Firecracker
-// forwards to the host's serial log file. One line per check, then a summary
+// Output goes to stdout, which is the serial console either way (vmsetup sets
+// up PID 1's stdio, zpinit inherits it across the execve, and every child
+// inherits it from zpinit), and Firecracker forwards it
+// to the host. One line per check, then a summary
 // line the host-side harness greps for. It is a test fixture, not part of the
 // shipped binary.
 package main
@@ -19,9 +21,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type checker struct {
@@ -45,20 +52,36 @@ func (e *envList) String() string     { return strings.Join(*e, ",") }
 func (e *envList) Set(v string) error { *e = append(*e, v); return nil }
 
 func main() {
+	// The harness also installs this binary as the image's own
+	// /usr/local/bin/zpinit, a stand-in for a zpinit-native image. The
+	// bundle's zpinit must be what runs as PID 1, so this must never run.
+	if filepath.Base(os.Args[0]) == "zpinit" {
+		fmt.Println("SHADOW-STUB-RAN: the image's own zpinit was executed")
+		os.Exit(1)
+	}
 	var (
-		hostname   = flag.String("hostname", "", "hostname vminit was told to set")
+		hostname   = flag.String("hostname", "", "hostname vmsetup was told to set")
 		address    = flag.String("address", "", "interface address in CIDR form")
 		iface      = flag.String("interface", "eth0", "interface name")
 		gateway    = flag.String("gateway", "", "default gateway")
 		nameserver = flag.String("nameserver", "", "expected nameserver in /etc/resolv.conf")
 		uid        = flag.Int("uid", 0, "uid the service is expected to run as")
 		gid        = flag.Int("gid", 0, "gid the service is expected to run as")
-		probeURL   = flag.String("http", "", "URL on the host to fetch, proving the network works end to end")
+		serve      = flag.String("serve", "", "listen on this address and wait for the host to fetch /ping, proving the network works end to end")
 		hold       = flag.Bool("hold", false, "sleep forever after reporting instead of exiting")
+		ignoreTerm = flag.Bool("ignore-term", false, "ignore SIGTERM, so a graceful stop has to escalate to SIGKILL")
+		chain      = flag.String("chain", "zpinit", "expected ancestors' comm, nearest first, ending at PID 1")
+		envFile    = flag.String("envfile", "", "env file vmsetup writes; checked for presence and mode 0600")
+		sessLeader = flag.Bool("session-leader", false, "expect to be a session leader")
+		pid1Exe    = flag.String("pid1-exe", "/run/zpinit/bin/zpinit", "what /proc/1/exe must point at: the bundle's zpinit, never the image's")
 		expectEnv  envList
 	)
 	flag.Var(&expectEnv, "env", "expected KEY=value, repeatable")
 	flag.Parse()
+
+	if *ignoreTerm {
+		signal.Ignore(syscall.SIGTERM)
+	}
 
 	c := &checker{}
 
@@ -69,6 +92,23 @@ func main() {
 
 	mounts := readMounts()
 	fmt.Printf("PROBE info root                         %s\n", mounts["/"].opts)
+	// The root is the VM's own disk, writable, switched into from the
+	// initramfs (PLAN.md §5.2).
+	root, ok := mounts["/"]
+	c.check("root is the writable disk", ok && root.fstype == "ext4" && strings.HasPrefix(root.opts, "rw"), describe(root, ok, "ext4"))
+	// The bundle's zpinit and zpctl, on a read-only tmpfs of their own.
+	bin, ok := mounts["/run/zpinit/bin"]
+	c.check("zpinit bin tmpfs read-only", ok && bin.fstype == "tmpfs" && strings.HasPrefix(bin.opts, "ro"), describe(bin, ok, "tmpfs"))
+	if fi, err := os.Stat("/run/zpinit/machine.json"); err == nil {
+		c.check("machine.json mode", fi.Mode().Perm() == 0o600, fmt.Sprintf("mode=%04o size=%d", fi.Mode().Perm(), fi.Size()))
+	} else {
+		c.check("machine.json", false, err.Error())
+	}
+	// The initramfs was freed: its /init is gone from the old root, and
+	// nothing of it is reachable from the new one.
+	_, err := os.Stat("/init")
+	c.check("no initramfs leftovers in /", os.IsNotExist(err), fmt.Sprintf("%v", err))
+
 	// The standard table from PLAN.md §5.2. devtmpfs on /dev has to be
 	// there for any of the rest to mean anything.
 	for _, want := range []struct{ path, fstype string }{
@@ -137,7 +177,7 @@ func main() {
 		c.check("env "+k, present && got == v, fmt.Sprintf("%q (want %q)", got, v))
 	}
 	// HOME and TERM are what a container runtime would have supplied; §5.5
-	// makes vminit supply them.
+	// makes vmsetup supply them.
 	for _, k := range []string{"HOME", "TERM", "PATH"} {
 		v, present := os.LookupEnv(k)
 		c.check("env "+k+" set", present && v != "", v)
@@ -145,33 +185,53 @@ func main() {
 
 	// The env file is how the composed environment reaches entrypoint.d
 	// scripts. 0600 because image env routinely carries credentials.
-	if fi, err := os.Stat("/run/zpinit/env"); err == nil {
-		c.check("/run/zpinit/env", true, fmt.Sprintf("mode=%04o size=%d", fi.Mode().Perm(), fi.Size()))
-		c.check("/run/zpinit/env mode", fi.Mode().Perm() == 0o600, fmt.Sprintf("%04o", fi.Mode().Perm()))
-	} else {
-		c.check("/run/zpinit/env", false, err.Error())
+	if *envFile != "" {
+		if fi, err := os.Stat(*envFile); err == nil {
+			c.check("env_file mode", fi.Mode().Perm() == 0o600, fmt.Sprintf("%s mode=%04o size=%d", *envFile, fi.Mode().Perm(), fi.Size()))
+		} else {
+			c.check("env_file", false, err.Error())
+		}
 	}
 
 	c.check("uid", os.Getuid() == *uid, strconv.Itoa(os.Getuid()))
 	c.check("gid", os.Getgid() == *gid, strconv.Itoa(os.Getgid()))
 
-	// vminit must have exec'd away: zpinit owns PID 1, and the probe is one
-	// of its children rather than a child of a lingering vminit.
-	c.check("pid1 is zpinit", strings.Contains(pid1Comm(), "zpinit"), pid1Comm())
+	// vmsetup execs zpinit (PLAN.md §5.6), so PID 1 is zpinit and the
+	// expected process tree is probe -> zpinit(1).
+	got := ancestors()
+	c.check("process chain", got == *chain, fmt.Sprintf("%q (want %q)", got, *chain))
 	c.check("probe is not pid1", os.Getpid() != 1, strconv.Itoa(os.Getpid()))
 
-	if *probeURL != "" {
-		body, err := fetch(*probeURL)
-		c.check("host reachable", err == nil, fmt.Sprintf("%s %v", body, err))
+	// Machine-mode detection for zpinit: "PID 1 in the initial PID namespace"
+	// rests on that namespace's inode being the fixed PROC_PID_INIT_INO
+	// (0xEFFFFFFC). The probe shares PID 1's namespace, so its own link is
+	// the one zpinit would read. /proc/1/ns/pid needs ptrace-read access to
+	// PID 1, so it is only compared when readable (root).
+	const initPidNS = "pid:[4026531836]"
+	self, err := os.Readlink("/proc/self/ns/pid")
+	c.check("initial pid namespace", err == nil && self == initPidNS, fmt.Sprintf("%s %v", self, err))
+	if one, err := os.Readlink("/proc/1/ns/pid"); err == nil {
+		c.check("pid1 in initial pid namespace", one == initPidNS, one)
+	}
+	// Readable only with ptrace-read access to PID 1, so as root.
+	if exe, err := os.Readlink("/proc/1/exe"); err == nil {
+		c.check("pid1 is the bundle's zpinit", exe == *pid1Exe, exe)
+	}
+	if *sessLeader {
+		sid, _ := unix.Getsid(0)
+		c.check("session leader", sid == os.Getpid(), fmt.Sprintf("sid=%d pid=%d", sid, os.Getpid()))
+	}
+
+	if *serve != "" {
+		peer, err := awaitPing(*serve, 30*time.Second)
+		c.check("host reached guest", err == nil, fmt.Sprintf("from %s %v", peer, err))
 	}
 
 	fmt.Printf("PROBE-RESULT pass=%d fail=%d\n", c.pass, c.fail)
 
 	if *hold {
-		// zpinit v0.5.5 has no VM mode yet, so a service that exits takes
-		// zpinit with it and PID 1 exiting panics the kernel. Holding keeps
-		// the machine alive for the host to inspect and shut down.
-		// See ZPINIT_CHANGES.md §2.
+		// Keeps the machine up until the harness requests a graceful
+		// stop, which is what the stop scenarios exercise.
 		for {
 			time.Sleep(time.Hour)
 		}
@@ -277,7 +337,7 @@ func addrList(name string) string {
 }
 
 // hasDefaultRoute reads /proc/net/route rather than opening a netlink socket,
-// to keep the probe independent of the library vminit itself uses. A default
+// to keep the probe independent of the library vmsetup itself uses. A default
 // route is the entry with a zero destination and a zero mask.
 func hasDefaultRoute(gateway string) bool {
 	b, err := os.ReadFile("/proc/net/route")
@@ -311,31 +371,76 @@ func loopbackUp() bool {
 	return err == nil && lo.Flags&net.FlagUp != 0
 }
 
-func pid1Comm() string {
-	b, err := os.ReadFile("/proc/1/comm")
-	if err != nil {
-		return err.Error()
+// ancestors walks the parent chain from the probe up to PID 1 and returns
+// the comm of each ancestor, nearest first, comma-separated.
+func ancestors() string {
+	var out []string
+	pid := os.Getppid()
+	for range 8 {
+		comm, ppid, err := stat(pid)
+		if err != nil {
+			return err.Error()
+		}
+		out = append(out, comm)
+		if pid == 1 {
+			break
+		}
+		pid = ppid
 	}
-	return strings.TrimSpace(string(b))
+	return strings.Join(out, ",")
 }
 
-// fetch proves the network works end to end: the address, the route and the
-// host's TAP device all have to be right for this to return.
-func fetch(url string) (string, error) {
-	client := &http.Client{Timeout: 5 * time.Second}
-	var lastErr error
-	// The host listener may not be up at the instant the guest boots.
-	for range 20 {
-		resp, err := client.Get(url)
-		if err != nil {
-			lastErr = err
-			time.Sleep(250 * time.Millisecond)
-			continue
-		}
-		body := make([]byte, 64)
-		n, _ := resp.Body.Read(body)
-		resp.Body.Close()
-		return strings.TrimSpace(string(body[:n])), nil
+// stat reads comm and ppid from /proc/<pid>/stat. comm is parenthesised and
+// may contain spaces, so the fields after it are found from the last ')'.
+func stat(pid int) (string, int, error) {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return "", 0, err
 	}
-	return "", lastErr
+	s := string(b)
+	open, close := strings.IndexByte(s, '('), strings.LastIndexByte(s, ')')
+	if open < 0 || close < open {
+		return "", 0, fmt.Errorf("unparseable /proc/%d/stat", pid)
+	}
+	f := strings.Fields(s[close+1:])
+	if len(f) < 2 {
+		return "", 0, fmt.Errorf("short /proc/%d/stat", pid)
+	}
+	ppid, err := strconv.Atoi(f[1])
+	return s[open+1 : close], ppid, err
+}
+
+// awaitPing proves the network works end to end: the host fetches /ping from
+// this listener, and the reply has to find its way back over the guest's
+// address and routes. It is host-initiated because the boot-test host's
+// firewall drops guest-initiated connections to it; in the routed /32 case
+// the reply to the host's link-local address can only leave via the onlink
+// default route, so that route is still what is being exercised.
+//
+// "PROBE serving" is the host's cue to start fetching.
+func awaitPing(addr string, timeout time.Duration) (string, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return "", err
+	}
+	defer ln.Close()
+	got := make(chan string, 1)
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "pong")
+		select {
+		case got <- r.RemoteAddr:
+		default:
+		}
+	})}
+	go srv.Serve(ln)
+	defer srv.Close()
+	fmt.Printf("PROBE serving %s\n", addr)
+	select {
+	case peer := <-got:
+		// Let the response flush before the server closes.
+		time.Sleep(100 * time.Millisecond)
+		return peer, nil
+	case <-time.After(timeout):
+		return "", fmt.Errorf("no fetch from the host within %s", timeout)
+	}
 }

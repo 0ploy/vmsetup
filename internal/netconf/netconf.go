@@ -7,8 +7,8 @@
 // netlink rather than by running `ip`, because a `scratch` image has no
 // iproute2 and Alpine's busybox `ip` is not Debian's.
 //
-// Every operation is written to be idempotent, because `vminit agent` calls
-// back into this package when MMDS changes.
+// Every operation is written to be idempotent, so re-applying a configuration
+// is not an error.
 package netconf
 
 import (
@@ -19,7 +19,7 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
-	"github.com/0ploy/vminit/internal/config"
+	"github.com/0ploy/vmsetup/internal/config"
 )
 
 // Logger is the subset of vmlog.Logger this package needs.
@@ -28,14 +28,13 @@ type Logger interface {
 	Warnf(format string, args ...any)
 }
 
-// Apply brings up loopback and every configured interface. mmdsAddr is the
-// MMDS service address, used for the per-link host route.
-func Apply(log Logger, nc config.Network, mmdsAddr string) error {
+// Apply brings up loopback and every configured interface.
+func Apply(log Logger, nc config.Network) error {
 	if err := upLoopback(); err != nil {
 		return err
 	}
 	for _, iface := range nc.Interfaces {
-		if err := applyInterface(log, iface, mmdsAddr); err != nil {
+		if err := applyInterface(log, iface); err != nil {
 			return fmt.Errorf("interface %s: %w", iface.Name, err)
 		}
 	}
@@ -55,7 +54,7 @@ func upLoopback() error {
 	return nil
 }
 
-func applyInterface(log Logger, iface config.Interface, mmdsAddr string) error {
+func applyInterface(log Logger, iface config.Interface) error {
 	link, err := findLink(iface)
 	if err != nil {
 		return err
@@ -101,10 +100,10 @@ func applyInterface(log Logger, iface config.Interface, mmdsAddr string) error {
 	}
 
 	if iface.MMDS {
-		if err := addMMDSRoute(link, mmdsAddr); err != nil {
+		if err := addMMDSRoute(link, config.MMDSAddress); err != nil {
 			return fmt.Errorf("add MMDS route on %s: %w", name, err)
 		}
-		log.Infof("MMDS route to %s on %s", mmdsAddr, name)
+		log.Infof("MMDS route to %s on %s", config.MMDSAddress, name)
 	}
 
 	return nil
@@ -163,8 +162,7 @@ func findLink(iface config.Interface) (netlink.Link, error) {
 // route add fails with ENETUNREACH ("nexthop has invalid gateway"). ONLINK
 // tells the kernel to treat it as directly reachable, which it genuinely is:
 // the tap is point-to-point with the host on the other end. Verified end to
-// end in fctl/docs/RESEARCH.md §7, along with the three variants that were
-// rejected.
+// end by the routed32 boot scenario (PLAN.md §5.3, §11).
 //
 // The flag is set only when the configured address really does not cover the
 // gateway. On a conventional subnet a mistyped gateway still fails loudly at
@@ -208,7 +206,7 @@ func addMMDSRoute(link netlink.Link, addr string) error {
 
 // replaceRoute adds a route, replacing one that already matches. RouteReplace
 // is used rather than RouteAdd so re-applying a configuration is not an
-// error; the agent re-applies on every MMDS change.
+// error.
 func replaceRoute(route *netlink.Route) error {
 	if err := netlink.RouteReplace(route); err != nil {
 		if errors.Is(err, unix.EEXIST) {

@@ -16,7 +16,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/0ploy/vminit/internal/config"
+	"github.com/0ploy/vmsetup/internal/config"
 )
 
 // Logger is the subset of vmlog.Logger this package needs.
@@ -106,7 +106,7 @@ func resolvConf(nc config.Network) string {
 // nothing.
 func write(path, content string) error {
 	dir := filepath.Dir(path)
-	tmp := filepath.Join(dir, "."+filepath.Base(path)+".vminit")
+	tmp := filepath.Join(dir, "."+filepath.Base(path)+".vmsetup")
 	_ = os.Remove(tmp)
 
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|unix.O_NOFOLLOW, 0o644)
@@ -128,7 +128,3 @@ func write(path, content string) error {
 	}
 	return nil
 }
-
-// Write is exported for `vminit agent`, which rewrites these same files when
-// MMDS changes.
-func Write(path, content string) error { return write(path, content) }

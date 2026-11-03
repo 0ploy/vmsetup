@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/0ploy/vminit/internal/config"
+	"github.com/0ploy/vmsetup/internal/config"
 )
 
 func TestHostsFile(t *testing.T) {

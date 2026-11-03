@@ -1,112 +1,76 @@
-// Package config defines the configuration schema shared by vminit (which
-// reads it inside the guest) and vmpack (which writes it at image build
-// time). Co-locating the reader and the writer is the whole reason those two
-// binaries live in one repository: drift between them is the likeliest bug in
-// the design.
+// Package config defines the guest config: the one JSON document fctl
+// composes for each launch and vmsetup reads at boot. See PLAN.md §4.
 //
-// The schema is specified in PLAN.md §4.2. Three layers merge into it:
-// build-time defaults at /etc/vminit/config.json, a boot-time override at
-// /etc/vminit/override.json written by fctl, and live MMDS updates applied by
-// `vminit agent`. See merge.go for the merge rules.
+// vmsetup owns the schema and fctl writes it. Drift between the writer and the
+// reader is the likeliest bug in the design, so the document carries only
+// resolved values (principle 7: no merging in the guest) and decoding is
+// strict -- a field vmsetup does not know is an error, never silently ignored.
 package config
 
-import "fmt"
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"path"
+	"strings"
+	"time"
 
-// Profile selects the handoff target, and with it who configures the
-// machine's network. See PLAN.md §4.3.
-type Profile string
-
-const (
-	// ProfileZpinit brings the machine up and execve's zpinit, which
-	// becomes PID 1.
-	ProfileZpinit Profile = "zpinit"
-	// ProfileCommand brings the machine up and forks the image's
-	// entrypoint, staying PID 1 to reap and own the machine lifecycle.
-	ProfileCommand Profile = "command"
-	// ProfileCloudInit pins the cloud-init datasource and execs the
-	// image's init; cloud-init configures the network.
-	ProfileCloudInit Profile = "cloud-init"
-	// ProfileSystemd writes network config for systemd's network stack,
-	// enables it, and execs the image's init.
-	ProfileSystemd Profile = "systemd"
-	// ProfileOpenRC writes /etc/network/interfaces, enables OpenRC's
-	// networking service, and execs the image's init.
-	ProfileOpenRC Profile = "openrc"
+	"golang.org/x/sys/unix"
 )
 
-// Apply reports whether the profile makes vminit configure the machine
-// imperatively (mounts, netlink, identity files). The generate profiles
-// return false: systemd and OpenRC own mounts, cgroups and network
-// management, so vminit must write files they will consume and touch
-// nothing else.
-func (p Profile) Apply() bool {
-	return p == ProfileZpinit || p == ProfileCommand
-}
-
-// Config is the merged result of every configuration layer.
+// Config is the whole guest config, PLAN.md §4.2.
 type Config struct {
 	Hostname string `json:"hostname,omitempty"`
 
-	// Image holds the OCI image config verbatim, as vmpack found it.
-	Image Image `json:"image"`
+	// Handoff is what zpinit runs once vmsetup execs it.
+	Handoff Handoff `json:"handoff"`
 
-	// ExecOverride replaces Image.Entrypoint and Image.Cmd wholesale,
-	// matching `docker run --entrypoint`. An empty slice means unset.
-	ExecOverride []string `json:"exec_override,omitempty"`
-	// UserOverride replaces Image.User, matching `docker run --user`.
-	UserOverride string `json:"user_override,omitempty"`
-	// ExtraEnv layers over Image.Env, matching `docker run -e`.
-	ExtraEnv map[string]string `json:"extra_env,omitempty"`
+	// Env is the composed environment, final, in OCI KEY=value form.
+	// Order is significant: a later entry for the same key wins.
+	Env []string `json:"env,omitempty"`
 
 	Network Network `json:"network"`
 
-	// Mounts are extra data volumes, applied after the standard mount
-	// table.
+	// Root is the VM's disk. vmsetup mounts it and switches root into it
+	// (PLAN.md §5.2).
+	Root Root `json:"root"`
+
+	// Mounts are extra data volumes, mounted after the standard table.
 	Mounts []Mount `json:"mounts,omitempty"`
 
-	// OverlayRoot, when set, makes vminit assemble an overlay root and
-	// pivot_root into it before mounting anything else. See PLAN.md §5.2.
-	OverlayRoot *OverlayRoot `json:"overlay_root,omitempty"`
+	// Exec, when set, is passed to zpinit, which listens for exec requests
+	// over vsock. Absent means no listener. PLAN.md §6.1.
+	Exec *Exec `json:"exec,omitempty"`
 
-	Boot    Boot    `json:"boot"`
 	Logging Logging `json:"logging"`
-	MMDS    MMDS    `json:"mmds"`
 }
 
-// Image is the subset of the OCI image config that matters to boot.
-type Image struct {
-	Entrypoint []string `json:"entrypoint,omitempty"`
-	Cmd        []string `json:"cmd,omitempty"`
-	// Env is in OCI form: a list of KEY=value strings, order significant.
-	Env        []string `json:"env,omitempty"`
-	WorkingDir string   `json:"working_dir,omitempty"`
-	User       string   `json:"user,omitempty"`
-	StopSignal string   `json:"stop_signal,omitempty"`
+// Handoff is fully resolved by fctl: Docker's --entrypoint / --user / -w /
+// command semantics have already been applied host-side (PLAN.md §8.1).
+//
+// Command decides zpinit's mode. Present: wrap mode, zpinit runs it as its
+// one child, as User in WorkingDir. Absent: supervise mode, the image's own
+// /etc/zpinit services, and then User and WorkingDir must be absent too,
+// because they live in that service TOML.
+type Handoff struct {
+	// Command is the Docker command, entrypoint + cmd, argv form.
+	Command []string `json:"command,omitempty"`
+	// User is user[:group], names or numeric ids. With Command only.
+	User string `json:"user,omitempty"`
+	// WorkingDir is absolute. With Command only.
+	WorkingDir string `json:"working_dir,omitempty"`
+	// StopSignal is what zpinit sends the command on graceful stop.
+	StopSignal string `json:"stop_signal"`
+	// StopTimeout is zpinit's whole graceful-stop budget. fctl keeps it
+	// below its own stop.timeout_sec.
+	StopTimeout Duration `json:"stop_timeout"`
 }
 
-// Argv returns the command to run: ExecOverride if set, else Entrypoint
-// followed by Cmd. This mirrors Docker's semantics, where --entrypoint
-// replaces both halves rather than only the first.
-func (c *Config) Argv() []string {
-	if len(c.ExecOverride) > 0 {
-		return c.ExecOverride
-	}
-	argv := make([]string, 0, len(c.Image.Entrypoint)+len(c.Image.Cmd))
-	argv = append(argv, c.Image.Entrypoint...)
-	return append(argv, c.Image.Cmd...)
-}
-
-// User returns the user spec to resolve: UserOverride if set, else the
-// image's User, else root.
-func (c *Config) User() string {
-	if c.UserOverride != "" {
-		return c.UserOverride
-	}
-	if c.Image.User != "" {
-		return c.Image.User
-	}
-	return "root"
-}
+// Wrap reports whether zpinit runs a single command (wrap mode) rather than
+// the image's services (supervise mode).
+func (h Handoff) Wrap() bool { return len(h.Command) > 0 }
 
 type Network struct {
 	Interfaces  []Interface `json:"interfaces,omitempty"`
@@ -118,10 +82,9 @@ type Network struct {
 type Interface struct {
 	Name string `json:"name"`
 	// MAC pins the link by hardware address. Firecracker does not
-	// guarantee that NIC enumeration order matches the order the API was
-	// called in, so set this whenever there is more than one interface.
+	// guarantee NIC enumeration order matches API call order.
 	MAC string `json:"mac,omitempty"`
-	// Address is the interface address in CIDR form, e.g. 172.16.0.2/30.
+	// Address is the interface address in CIDR form, e.g. 10.77.0.5/32.
 	Address string `json:"address,omitempty"`
 	Gateway string `json:"gateway,omitempty"`
 	// MMDS adds a host route to the MMDS address over this link.
@@ -140,134 +103,136 @@ type Mount struct {
 	Options string `json:"options,omitempty"`
 }
 
-type OverlayRoot struct {
-	Lower   Layer  `json:"lower"`
-	Upper   Layer  `json:"upper"`
-	WorkDir string `json:"workdir,omitempty"`
+// Root is the VM's disk: a writable, per-VM copy of the image, which fctl
+// attached and names here. vmsetup never guesses.
+type Root struct {
+	Device  string `json:"device"`
+	FSType  string `json:"fstype"`
+	Options string `json:"options,omitempty"`
 }
 
-// Layer is one half of an overlay root. Device is a block device path, or
-// the literal "tmpfs" for an ephemeral upper layer.
-type Layer struct {
-	Device string `json:"device"`
-	FSType string `json:"fstype"`
-}
-
-type Boot struct {
-	Profile Profile `json:"profile"`
-
-	// Path and Args are the handoff target for profile "zpinit".
-	Path string   `json:"path,omitempty"`
-	Args []string `json:"args,omitempty"`
-
-	// Network selects the config format for profile "systemd" only:
-	// auto | netplan | systemd-networkd | ifupdown.
-	Network string `json:"network,omitempty"`
-
-	// Init is the image's init, exec'd by the generate profiles.
-	Init string `json:"init,omitempty"`
+type Exec struct {
+	// Port is the vsock port zpinit listens on.
+	Port uint32 `json:"port"`
+	// User is the default identity for an exec request: the image's OCI
+	// User, not the handoff user.
+	User       string `json:"user"`
+	WorkingDir string `json:"working_dir"`
 }
 
 type LogTarget string
 
 const (
 	// LogSerial writes to /dev/ttyS0, which Firecracker forwards to a
-	// per-VM file on the host. See PLAN.md §7.2 for why this does not
-	// need console= on the kernel command line.
+	// per-VM file on the host. Works without console= (PLAN.md §7.2).
 	LogSerial LogTarget = "serial"
 	LogNone   LogTarget = "none"
 )
 
 type Logging struct {
-	Target LogTarget `json:"target,omitempty"`
+	Target LogTarget `json:"target"`
 }
 
-type MMDS struct {
-	// Enabled turns on the `vminit agent` poll loop. It does not affect
-	// boot: the MMDS route is requested per interface instead.
-	Enabled bool   `json:"enabled,omitempty"`
-	Address string `json:"address,omitempty"`
-	// Version must be V2. V1 is unauthenticated, so any process in the
-	// guest can read the metadata; PLAN.md §9 forbids falling back to it
-	// even when the host offers it.
-	Version string `json:"version,omitempty"`
-	// PollInterval is a Go duration string, e.g. "30s".
-	PollInterval string `json:"poll_interval,omitempty"`
+// MMDSAddress is where Firecracker's MMDS answers. It is fixed by
+// Firecracker's default, so it is not a config field: one more value fctl
+// and vmsetup could disagree on buys nothing.
+const MMDSAddress = "169.254.169.254"
+
+// Duration is a time.Duration that encodes as a Go duration string ("10s").
+type Duration time.Duration
+
+func (d Duration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(d).String())
 }
 
-// Defaults for the values that have a single sensible answer. Anything
-// where guessing wrong would boot a subtly wrong machine is left unset and
-// rejected by Validate instead.
-const (
-	DefaultZpinitPath  = "/usr/local/bin/zpinit"
-	DefaultInit        = "/sbin/init"
-	DefaultMMDSAddress = "169.254.169.254"
-	DefaultMMDSVersion = "V2"
-	DefaultPollInteval = "30s"
-	DefaultOverlayWork = "/overlay/work"
-)
+func (d *Duration) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return fmt.Errorf("duration must be a string like \"10s\": %w", err)
+	}
+	v, err := time.ParseDuration(s)
+	if err != nil {
+		return err
+	}
+	*d = Duration(v)
+	return nil
+}
 
-// ApplyDefaults fills in the values that are safe to assume.
+// Parse decodes and validates a config document. Unknown fields and trailing
+// data are errors.
+func Parse(doc []byte) (*Config, error) {
+	dec := json.NewDecoder(bytes.NewReader(doc))
+	dec.DisallowUnknownFields()
+	var c Config
+	if err := dec.Decode(&c); err != nil {
+		return nil, fmt.Errorf("decode config: %w", err)
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("decode config: trailing data after the document")
+	}
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+// Validate rejects a document that cannot produce a correct machine, naming
+// the field. Every violation is a host-side composition bug; vmsetup parks on
+// it (PLAN.md §4.2, principle 5).
 //
-// boot.args is deliberately not defaulted. The zpinit profile needs
-// --vm to make zpinit reboot rather than exit as PID 1, but inventing a
-// flag for a binary we only exec would silently break older zpinit
-// releases that do not accept it. vmpack writes the flag; vminit warns at
-// boot when it is missing (see checkZpinitArgs in cmd/vminit).
-func (c *Config) ApplyDefaults() {
-	if c.Boot.Profile == ProfileZpinit && c.Boot.Path == "" {
-		c.Boot.Path = DefaultZpinitPath
-	}
-	if !c.Boot.Profile.Apply() && c.Boot.Init == "" {
-		c.Boot.Init = DefaultInit
-	}
-	if c.Boot.Profile == ProfileSystemd && c.Boot.Network == "" {
-		c.Boot.Network = "auto"
-	}
-	if c.Logging.Target == "" {
-		c.Logging.Target = LogSerial
-	}
-	if c.MMDS.Address == "" {
-		c.MMDS.Address = DefaultMMDSAddress
-	}
-	if c.MMDS.Version == "" {
-		c.MMDS.Version = DefaultMMDSVersion
-	}
-	if c.MMDS.PollInterval == "" {
-		c.MMDS.PollInterval = DefaultPollInteval
-	}
-	if c.OverlayRoot != nil && c.OverlayRoot.WorkDir == "" {
-		c.OverlayRoot.WorkDir = DefaultOverlayWork
-	}
-}
-
-// Validate rejects a configuration that cannot produce a correct machine.
-// It is deliberately strict: principle 5 in PLAN.md §2 is that a
-// misconfigured network which boots anyway is worse than a VM that refuses
-// to start with a clear message.
+// Nothing is defaulted. Every field anything acts on arrives resolved, and a
+// required field that is missing is an error rather than a guess.
 func (c *Config) Validate() error {
-	switch c.Boot.Profile {
-	case ProfileZpinit, ProfileCommand, ProfileCloudInit, ProfileSystemd, ProfileOpenRC:
-	case "":
-		return fmt.Errorf("boot.profile is required")
-	default:
-		return fmt.Errorf("boot.profile %q unknown (want zpinit, command, cloud-init, systemd or openrc)", c.Boot.Profile)
+	h := c.Handoff
+	if h.Wrap() {
+		if h.Command[0] == "" {
+			return errors.New("handoff.command[0] must be non-empty")
+		}
+		if h.User == "" {
+			return errors.New("handoff.user is required with handoff.command")
+		}
+		if !path.IsAbs(h.WorkingDir) {
+			return fmt.Errorf("handoff.working_dir %q must be an absolute path", h.WorkingDir)
+		}
+	} else if h.Command != nil {
+		return errors.New("handoff.command must be non-empty when present; omit it for supervise mode")
+	} else if h.User != "" || h.WorkingDir != "" {
+		return errors.New("handoff.user and handoff.working_dir are only valid with handoff.command; in supervise mode they live in the image's zpinit service TOML")
+	}
+	if h.StopSignal == "" {
+		return errors.New("handoff.stop_signal is required")
+	}
+	if unix.SignalNum(h.StopSignal) == 0 {
+		return fmt.Errorf("handoff.stop_signal %q is not a signal name vmsetup knows (want e.g. SIGTERM)", h.StopSignal)
+	}
+	if h.StopTimeout <= 0 {
+		return errors.New("handoff.stop_timeout is required and must be positive")
 	}
 
-	switch c.Logging.Target {
-	case LogSerial, LogNone:
-	default:
-		return fmt.Errorf("logging.target %q unknown (want serial or none)", c.Logging.Target)
+	r := c.Root
+	if r.Device == "" || r.FSType == "" {
+		return errors.New("root: device and fstype are required")
+	}
+	if !path.IsAbs(r.Device) {
+		return fmt.Errorf("root.device %q must be an absolute path", r.Device)
+	}
+	for _, o := range strings.Split(r.Options, ",") {
+		if strings.TrimSpace(o) == "ro" {
+			return errors.New("root.options must not contain ro: the root is the VM's writable disk")
+		}
 	}
 
-	if c.MMDS.Version != DefaultMMDSVersion {
-		return fmt.Errorf("mmds.version %q refused: V1 is unauthenticated, so any process in the guest can read the metadata", c.MMDS.Version)
+	for i, e := range c.Env {
+		k, _, ok := strings.Cut(e, "=")
+		if !ok || k == "" {
+			return fmt.Errorf("env[%d] %q is not in KEY=value form", i, e)
+		}
 	}
 
 	seen := make(map[string]struct{}, len(c.Network.Interfaces))
 	for i, iface := range c.Network.Interfaces {
 		if iface.Name == "" {
-			return fmt.Errorf("network.interfaces[%d]: name is required", i)
+			return fmt.Errorf("network.interfaces[%d].name is required", i)
 		}
 		if _, dup := seen[iface.Name]; dup {
 			return fmt.Errorf("network.interfaces[%d]: duplicate name %q", i, iface.Name)
@@ -276,19 +241,32 @@ func (c *Config) Validate() error {
 	}
 
 	for i, m := range c.Mounts {
-		if m.Device == "" || m.Path == "" || m.FSType == "" {
-			return fmt.Errorf("mounts[%d]: device, path and fstype are all required", i)
+		if m.Device == "" || m.FSType == "" {
+			return fmt.Errorf("mounts[%d]: device and fstype are required", i)
+		}
+		if !path.IsAbs(m.Path) {
+			return fmt.Errorf("mounts[%d].path %q must be an absolute path", i, m.Path)
 		}
 	}
 
-	if o := c.OverlayRoot; o != nil {
-		if o.Lower.Device == "" || o.Lower.FSType == "" {
-			return fmt.Errorf("overlay_root.lower: device and fstype are required")
+	if e := c.Exec; e != nil {
+		if e.Port == 0 {
+			return errors.New("exec.port is required")
 		}
-		if o.Upper.Device == "" {
-			return fmt.Errorf("overlay_root.upper: device is required")
+		if e.User == "" {
+			return errors.New("exec.user is required")
+		}
+		if !path.IsAbs(e.WorkingDir) {
+			return fmt.Errorf("exec.working_dir %q must be an absolute path", e.WorkingDir)
 		}
 	}
 
+	switch c.Logging.Target {
+	case LogSerial, LogNone:
+	case "":
+		return errors.New("logging.target is required (serial or none)")
+	default:
+		return fmt.Errorf("logging.target %q unknown (want serial or none)", c.Logging.Target)
+	}
 	return nil
 }

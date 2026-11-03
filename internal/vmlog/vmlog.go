@@ -1,17 +1,15 @@
-// Package vmlog is vminit's console log.
+// Package vmlog is vmsetup's console log, and the park line the host
+// matches.
 //
-// The awkward part it exists to solve: vminit has to log before it can log.
-// The first thing it does is read its config, and at that point /dev has not
-// been mounted, so /dev/ttyS0 does not exist yet -- a rootfs exported from a
-// Docker image has no device nodes at all. PID 1's inherited stdio is no
-// help either, because production boots without console= on the kernel
-// command line (PLAN.md §7.2) and /dev/console may not have opened.
+// The awkward part it exists to solve: vmsetup may have to log before it can
+// log. In the initramfs /dev is empty until vmsetup mounts devtmpfs, and
+// PID 1's inherited stdio is no help either, because production boots
+// without console= (PLAN.md §7.2).
 //
 // So the logger starts out buffering, tees to stderr in case something is
 // listening there, and is switched onto the real serial port by Attach as
-// soon as devtmpfs is up. Anything logged before that point is flushed at
-// that moment rather than lost, which is what makes a config-parse failure
-// visible on the host.
+// soon as /dev is known to be up. Anything logged before that point is
+// flushed at that moment rather than lost (PLAN.md §5.1).
 package vmlog
 
 import (
@@ -21,6 +19,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -36,9 +35,9 @@ const SerialPath = "/dev/ttyS0"
 const maxBuffered = 64 << 10
 
 // Logger writes human-readable boot progress. Every line carries the elapsed
-// time since vminit started, which is a monotonic delta and therefore usable
+// time since vmsetup started, which is a monotonic delta and therefore usable
 // even though the guest's wall clock is not trustworthy this early. Absolute
-// boot timing is measured from the host; see fctl/docs/performance.md.
+// boot timing is measured from the host, by fctl.
 type Logger struct {
 	mu       sync.Mutex
 	start    time.Time
@@ -103,7 +102,7 @@ func (l *Logger) switchTo(w io.Writer) {
 	l.out = w
 	l.tee = nil
 	if l.overflow {
-		fmt.Fprintf(w, "[vminit] ... earlier output truncated at %d bytes\n", maxBuffered)
+		fmt.Fprintf(w, "[vmsetup] ... earlier output truncated at %d bytes\n", maxBuffered)
 	}
 	if l.buf.Len() > 0 {
 		_, _ = w.Write(l.buf.Bytes())
@@ -135,7 +134,7 @@ func (l *Logger) emit(level, format string, args ...any) {
 	// host-side parser reading the serial log, and Firecracker's rate
 	// limiter makes long output expensive anyway.
 	msg = strings.ReplaceAll(strings.TrimRight(msg, "\n"), "\n", "; ")
-	line := fmt.Sprintf("[vminit %8.3fms] %s%s\n", float64(time.Since(l.start).Microseconds())/1000, level, msg)
+	line := fmt.Sprintf("[vmsetup %8.3fms] %s%s\n", float64(time.Since(l.start).Microseconds())/1000, level, msg)
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -153,7 +152,25 @@ func (l *Logger) emit(level, format string, args ...any) {
 	}
 }
 
-// Elapsed reports how long vminit has been running, for the handoff log
-// line. This is vminit's own contribution to cold start: the interval from
-// the kernel exec'ing init= to the handoff.
+// Elapsed reports how long vmsetup has been running, for the handoff log
+// line. This is vmsetup's own contribution to cold start: the interval from
+// the kernel running /init to the execve of zpinit.
 func (l *Logger) Elapsed() time.Duration { return time.Since(l.start) }
+
+// Sentinel writes one protocol line to the serial port for the host to match:
+// the park line (PLAN.md §6.2). It is not a log line: it is written whatever
+// logging.target says, it carries no timestamp prefix, and it starts with a
+// newline so a partial line from the workload cannot swallow it.
+//
+// The port is opened afresh rather than reusing the log's file, because under
+// logging.target = "none" there is no log file. Best effort: if the port
+// cannot be opened there is nowhere else the host would look.
+func Sentinel(line string) {
+	f, err := os.OpenFile(SerialPath, os.O_WRONLY|os.O_APPEND|syscall.O_NOCTTY, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\n%s\n", line)
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "\n%s\n", line)
+}

@@ -1,4 +1,4 @@
-module github.com/0ploy/vminit
+module github.com/0ploy/vmsetup
 
 go 1.26
 

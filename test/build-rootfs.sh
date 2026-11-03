@@ -1,118 +1,203 @@
 #!/usr/bin/env bash
-# Assemble a bootable ext4 rootfs for the zpinit-handoff boot test.
+# Build the fixture for one boot-test scenario: the init bundle, a scratch-like
+# ext4 image, the config blob fctl would compose for it, and scenario.env
+# telling boot.sh what to expect.
 #
-# This is a stand-in for vmpack, not a replacement for it: it hand-writes the
-# config that vmpack will eventually generate from an OCI image config, so the
-# guest half can be tested before the packer exists. The one thing it does take
-# seriously is that the vminit config and the probe's expectations are
-# generated from the same variables below, so the fixture cannot drift.
+# This stands in for fctl, not for its logic. The one thing it
+# takes seriously is that the guest config, the probe's expectations and the
+# host's TAP are all generated from the variables below, so they cannot drift.
 #
-# The result is a `scratch`-like image: no shell, no libc, no userspace at all
-# beyond three static Go binaries. That is deliberate. It is the case that
-# proves vminit has no dependency on the guest image.
+# The image is deliberately `scratch`-like and carries no guest init: no
+# shell, no libc, only the probe (the "workload") and zpinit's service config.
+# vmsetup, zpinit and zpctl come from the init bundle, as under fctl. The
+# image also carries a stub /usr/local/bin/zpinit that must never run.
+#
+# Scenarios (PLAN.md §11). Those marked [machine] need zpinit's machine mode
+# (zpinit#10); run.sh skips them unless ZPINIT_MACHINE_MODE=1.
+#   base         supervise mode: the probe is a zpinit service; Ctrl+Alt+Del
+#                ends the VM.
+#   routed32     base, on fctl's routed /32 with a link-local gateway (§5.3).
+#   command      [machine] wrap mode: the probe is handoff.command, as an
+#                unprivileged user; it exits on its own -> cause=exit.
+#   stop         [machine] wrap mode, holding: Ctrl+Alt+Del -> stop_signal.
+#   stopkill     [machine] stop, but the probe ignores SIGTERM -> SIGKILL.
+#   park         a NIC MAC that does not exist: parks with step=network and
+#                zpinit idles in rescue until Ctrl+Alt+Del.
+#   noroot       the root device does not exist: parks with step=root, in the
+#                initramfs.
+#   nozpinit     a bundle without zpinit: parks with step=handoff and the VM
+#                ends at once, with no kernel panic.
+#   blob-magic   the config device has the wrong magic   -> parks, step=config
+#   blob-version the config blob is version 2            -> parks, step=config
+#   blob-noparam no vmsetup_config= on the command line   -> parks, step=config
 set -euo pipefail
 
 DIR=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$DIR/.." && pwd)
-ZPINIT=${ZPINIT:-$(cd "$REPO/../zpinit" && pwd)}
+# zpinit's source tree (github.com/0ploy/zpinit); the bundle is built from it.
+ZPINIT=${ZPINIT:?set ZPINIT to a zpinit source checkout}
 OUT=${OUT:-$DIR/rootfs.ext4}
+BLOB=${BLOB:-$DIR/config.blob}
+BUNDLE=${BUNDLE:-$DIR/init.cpio}
 TREE=${TREE:-$DIR/rootfs}
 SIZE=${SIZE:-192M}
-
-# The machine the guest is expected to end up with. Both the vminit config and
-# the probe's command line are generated from these.
-#
-# SCENARIO=base     one layer: /etc/vminit/config.json only.
-# SCENARIO=override two layers, so the merge rules of PLAN.md §4.1 are
-#                   exercised on a running machine and not only in unit tests.
-# SCENARIO=routed32 fctl's routed-address model: a bare /32 with no on-link
-#                   subnet at all, reached through a link-local gateway that
-#                   is shared by every tap on the host. Exercises the ONLINK
-#                   path in §5.3 -- without it the default route cannot be
-#                   installed and the guest reaches nothing.
 SCENARIO=${SCENARIO:-base}
-# BASE_HOST goes in config.json; HOST is what the merged config must resolve
-# to. They differ under SCENARIO=override so the override is provably applied.
-BASE_HOST=vminit-test-01
-HOST=$BASE_HOST
+
+# ---- the machine ------------------------------------------------------------
+HOST=vmsetup-test-01
 GUEST_CIDR=172.16.0.2/30
 GW=172.16.0.1
-GUEST_MAC=06:00:AC:10:00:02
-HOST_CIDR=$GW/30      # what the host puts on the TAP
-ROUTED=0              # 1 => host also needs an explicit /32 route to the guest
-if [ "$SCENARIO" = routed32 ]; then
-  BASE_HOST=vminit-test-03
-  HOST=$BASE_HOST
-  GUEST_CIDR=10.77.0.5/32
-  GW=169.254.0.1
-  GUEST_MAC=06:00:0A:4D:00:05
-  HOST_CIDR=$GW/32
-  ROUTED=1
-fi
+GUEST_MAC=06:00:AC:10:00:02   # what Firecracker gives the NIC
+CONFIG_MAC=$GUEST_MAC         # what the config tells vmsetup to look for
+HOST_CIDR=$GW/30              # what the host puts on the TAP
+ROUTED=0                      # 1 => host also needs a /32 route to the guest
+HTTP_PORT=${HTTP_PORT:-18080}
+ROOT_DEVICE=/dev/vdb          # Firecracker names drives in PUT order: blob vda, root vdb
+
+# ---- the handoff ------------------------------------------------------------
+MODE=supervise                # supervise | wrap
+PROBE_USER=root               # who the probe runs as
+STOP_TIMEOUT=5s
+PROBE_FLAGS=()
+BUNDLE_FLAGS=()
+
+# ---- what boot.sh expects ---------------------------------------------------
+CMDLINE_PARAM=1               # pass vmsetup_config=
+BLOB_FLAGS=()
+WAIT_FOR='^PROBE-RESULT'      # serial line that means "ready for ACTION"
+ACTION=cad                    # cad | none
+EXPECT_PROBE=1                # the probe must report fail=0
+STAYS_UP=0                    # 1 => the VM must still be up 2 s after WAIT_FOR
+NEEDS_MACHINE_MODE=0          # 1 => only meaningful once zpinit#10 has landed
+EXPECT_RESET=                 # ERE the final zpinit reset line must match, once zpinit#10 has landed
+MIN_STOP_SECS=0               # CAD -> VM exit must take at least this long
+
+case $SCENARIO in
+  base)
+    EXPECT_RESET='zpinit: reset intent=shutdown cause=stop status=0' ;;
+  routed32)
+    HOST=vmsetup-test-03
+    GUEST_CIDR=10.77.0.5/32
+    GW=169.254.0.1
+    GUEST_MAC=06:00:0A:4D:00:05
+    CONFIG_MAC=$GUEST_MAC
+    HOST_CIDR=$GW/32
+    ROUTED=1
+    EXPECT_RESET='zpinit: reset intent=shutdown cause=stop status=0' ;;
+  command)
+    MODE=wrap; PROBE_USER=app; ACTION=none; NEEDS_MACHINE_MODE=1
+    PROBE_FLAGS=(-session-leader)
+    EXPECT_RESET='zpinit: reset intent=shutdown cause=exit status=0' ;;
+  stop)
+    MODE=wrap; PROBE_USER=app; NEEDS_MACHINE_MODE=1
+    PROBE_FLAGS=(-session-leader -hold)
+    EXPECT_RESET='zpinit: reset intent=shutdown cause=stop signal=SIGTERM' ;;
+  stopkill)
+    MODE=wrap; PROBE_USER=app; STOP_TIMEOUT=2s; MIN_STOP_SECS=2; NEEDS_MACHINE_MODE=1
+    PROBE_FLAGS=(-session-leader -hold -ignore-term)
+    EXPECT_RESET='zpinit: reset intent=shutdown cause=stop signal=SIGKILL' ;;
+  park)
+    CONFIG_MAC=06:00:DE:AD:BE:EF
+    WAIT_FOR='^vmsetup: parked step=network '; EXPECT_PROBE=0; STAYS_UP=1
+    EXPECT_RESET='zpinit: reset intent=shutdown cause=parked' ;;
+  noroot)
+    ROOT_DEVICE=/dev/vdz
+    WAIT_FOR='^vmsetup: parked step=root error=".*vdz'; EXPECT_PROBE=0; STAYS_UP=1
+    EXPECT_RESET='zpinit: reset intent=shutdown cause=parked' ;;
+  nozpinit)
+    BUNDLE_FLAGS=(-test-omit-zpinit)
+    WAIT_FOR='^vmsetup: parked step=handoff error=".*no zpinit'; EXPECT_PROBE=0; ACTION=none ;;
+  blob-magic)
+    BLOB_FLAGS=(-magic EXT4)
+    WAIT_FOR='^vmsetup: parked step=config error=".*not the config device'; EXPECT_PROBE=0; STAYS_UP=1
+    EXPECT_RESET='zpinit: reset intent=shutdown cause=parked' ;;
+  blob-version)
+    BLOB_FLAGS=(-version 2)
+    WAIT_FOR='^vmsetup: parked step=config error=".*version 2'; EXPECT_PROBE=0; STAYS_UP=1
+    EXPECT_RESET='zpinit: reset intent=shutdown cause=parked' ;;
+  blob-noparam)
+    CMDLINE_PARAM=0
+    WAIT_FOR='^vmsetup: parked step=config error="no vmsetup_config='; EXPECT_PROBE=0; STAYS_UP=1
+    EXPECT_RESET='zpinit: reset intent=shutdown cause=parked' ;;
+  *)
+    echo "!! unknown scenario $SCENARIO" >&2; exit 2 ;;
+esac
+
 GUEST_IP=${GUEST_CIDR%%/*}
 NAMESERVER=$GW
-HTTP_PORT=${HTTP_PORT:-18080}
+case $PROBE_USER in
+  root) EXPECT_UID=0;    EXPECT_GID=0;    EXPECT_HOME=/root ;;
+  app)  EXPECT_UID=1000; EXPECT_GID=1000; EXPECT_HOME=/home/app ;;
+esac
 
-# What the merged configuration is expected to resolve to.
-EXPECT_USER=root
-EXPECT_UID=0
-EXPECT_GID=0
-EXPECT_HOME=/root
-EXPECT_OVERRIDDEN=from-extra-env
-EXPECT_EXTRA_ENV=(-env "IMAGE_VAR=from-image" -env "EXTRA_VAR=from-extra-env")
-if [ "$SCENARIO" = override ]; then
-  HOST=vminit-test-02
-  EXPECT_USER=app
-  EXPECT_UID=1000
-  EXPECT_GID=1000
-  EXPECT_HOME=/home/app
-  EXPECT_OVERRIDDEN=from-override
-  # IMAGE_VAR and EXTRA_VAR survive an override that mentions neither: that
-  # is the per-variable half of the merge rule.
-  EXPECT_EXTRA_ENV=(-env "IMAGE_VAR=from-image" -env "EXTRA_VAR=from-extra-env" -env "FROM_OVERRIDE=yes")
+PROBE_ARGV=(
+  /usr/local/bin/vmprobe
+  -hostname "$HOST"
+  -interface eth0 -address "$GUEST_CIDR" -gateway "$GW"
+  -nameserver "$NAMESERVER"
+  -uid "$EXPECT_UID" -gid "$EXPECT_GID"
+  -env IMAGE_VAR=from-image
+  -env DEPLOY_ENV=prod
+  -env LAST_WINS=second
+  -env "HOME=$EXPECT_HOME"
+  -envfile /run/zpinit/env
+  -chain zpinit
+  -serve ":$HTTP_PORT"
+)
+if [ "$MODE" = supervise ]; then
+  PROBE_ARGV+=(-hold)
+else
+  PROBE_ARGV+=("${PROBE_FLAGS[@]}")
 fi
+
+# json_list ARG... -> ["ARG", ...]. Fixture values contain no quotes or
+# backslashes, so no escaping is needed.
+json_list() { local IFS=,; local q=(); for a in "$@"; do q+=("\"$a\""); done; echo "[${q[*]}]"; }
 
 export PATH=/usr/local/go/bin:$PATH
 export CGO_ENABLED=0
 
 echo "==> building static binaries"
-# CGO_ENABLED=0 is not just about portability here: it is what makes os/user
-# parse /etc/passwd directly instead of going through NSS, which is the
-# behaviour PLAN.md §5.5 specifies.
-( cd "$REPO" && go build -trimpath -ldflags "-s -w -X main.version=test" -o "$DIR/bin/vminit" ./cmd/vminit )
+# CGO_ENABLED=0 also makes os/user parse /etc/passwd directly instead of going
+# through NSS, which is the behaviour PLAN.md §5.5 specifies.
+( cd "$REPO" && go build -trimpath -ldflags "-s -w -X main.version=test" -o "$DIR/bin/vmsetup" ./cmd/vmsetup )
+( cd "$REPO" && go build -trimpath -o "$DIR/bin/mkbundle" ./cmd/mkbundle )
 ( cd "$REPO" && go build -trimpath -ldflags "-s -w" -o "$DIR/bin/vmprobe" ./test/probe )
+( cd "$REPO" && go build -trimpath -o "$DIR/bin/mkblob" ./test/mkblob )
 ( cd "$ZPINIT" && go build -trimpath -ldflags "-s -w" -o "$DIR/bin/zpinit" ./cmd/zpinit )
 ( cd "$ZPINIT" && go build -trimpath -ldflags "-s -w" -o "$DIR/bin/zpctl" ./cmd/zpctl )
 
-for b in vminit vmprobe zpinit zpctl; do
+for b in vmsetup vmprobe zpinit zpctl; do
   if ldd "$DIR/bin/$b" 2>&1 | grep -qv 'not a dynamic executable'; then
-    echo "!! $b is dynamically linked; it will not run in a scratch rootfs" >&2
+    echo "!! $b is dynamically linked; it will not run from an initramfs or a scratch rootfs" >&2
     exit 1
   fi
 done
 
-echo "==> assembling tree"
+echo "==> building the init bundle $BUNDLE"
+"$DIR/bin/mkbundle" -vmsetup "$DIR/bin/vmsetup" -zpinit "$DIR/bin/zpinit" -zpctl "$DIR/bin/zpctl" \
+  "${BUNDLE_FLAGS[@]}" -o "$BUNDLE"
+
+echo "==> assembling the image"
 rm -rf "$TREE"
-# /proc, /sys, /dev, /run and /sys/fs/cgroup are mountpoints vminit creates if
-# missing, but a real image has them, so the fixture does too. /tmp and /var
-# are here because software expects them, not because vminit needs them.
-install -d -m 0755 "$TREE"/{dev,proc,sys,run,tmp,var,etc,root,usr/local/bin,sbin}
+# No /dev, /proc, /sys or /run: vmsetup creates missing mount points on the
+# writable root, and an OCI image need not have them.
+install -d -m 0755 "$TREE"/{tmp,var,etc,root,usr/local/bin}
 chmod 1777 "$TREE/tmp"
 
-install -m 0755 "$DIR/bin/vminit" "$TREE/sbin/vminit"
 install -m 0755 "$DIR/bin/vmprobe" "$TREE/usr/local/bin/vmprobe"
-install -m 0755 "$DIR/bin/zpinit" "$TREE/usr/local/bin/zpinit"
-install -m 0755 "$DIR/bin/zpctl" "$TREE/usr/local/bin/zpctl"
+# The image's own zpinit, as a zpinit-native image would carry. It is the
+# probe binary, which refuses to run under that name: the bundle's zpinit is
+# the only one that may ever be PID 1.
+install -m 0755 "$DIR/bin/vmprobe" "$TREE/usr/local/bin/zpinit"
 
-# The three files Docker's export leaves as 0-byte regular files. Reproducing
-# that exactly is the point: vminit has to fill them in.
+# The three files Docker's export leaves as 0-byte regular files.
 : > "$TREE/etc/hostname"
 : > "$TREE/etc/hosts"
 : > "$TREE/etc/resolv.conf"
 
-# A minimal passwd/group so user resolution has something to resolve. An
-# unknown *name* is fatal by design, so a fixture that resolves a name proves
-# the lookup path rather than the numeric shortcut.
+# An unknown user *name* parks by design, so resolving a name proves the
+# lookup path rather than the numeric shortcut.
 cat > "$TREE/etc/passwd" <<'EOF'
 root:x:0:0:root:/root:/sbin/nologin
 app:x:1000:1000:app:/home/app:/sbin/nologin
@@ -122,120 +207,72 @@ root:x:0:
 tty:x:5:
 app:x:1000:
 EOF
-install -d -m 0755 "$TREE/home/app"
+install -d -m 0755 -o 1000 -g 1000 "$TREE/home/app"
 
-echo "==> writing /etc/vminit/config.json"
-install -d -m 0755 "$TREE/etc/vminit"
-cat > "$TREE/etc/vminit/config.json" <<EOF
-{
-  "hostname": "$BASE_HOST",
-  "image": {
-    "entrypoint": ["/usr/local/bin/vmprobe"],
-    "cmd": [],
-    "env": [
-      "PATH=/usr/local/bin:/usr/bin:/bin:/sbin",
-      "IMAGE_VAR=from-image",
-      "OVERRIDDEN=from-image"
-    ],
-    "working_dir": "/",
-    "user": "root",
-    "stop_signal": "SIGTERM"
-  },
-  "extra_env": {
-    "OVERRIDDEN": "from-extra-env",
-    "EXTRA_VAR": "from-extra-env"
-  },
-  "network": {
-    "interfaces": [
-      {
-        "name": "eth0",
-        "mac": "$GUEST_MAC",
-        "address": "$GUEST_CIDR",
-        "gateway": "$GW",
-        "mmds": true
-      }
-    ],
-    "nameservers": ["$NAMESERVER"],
-    "extra_hosts": [{ "ip": "10.0.0.5", "host": "db.internal" }]
-  },
-  "boot": {
-    "profile": "zpinit",
-    "path": "/usr/local/bin/zpinit",
-    "args": []
-  },
-  "logging": { "target": "serial" },
-  "mmds": { "enabled": false }
-}
-EOF
-# boot.args is empty on purpose. zpinit has no --vm flag yet
-# (ZPINIT_CHANGES.md §1), and older releases reject unknown flags, so passing
-# it would fail the exec. vminit warns about this at boot; the warning showing
-# up in the serial log is itself part of what this test checks.
-
-# The per-launch layer fctl writes into the rootfs before boot. It restates
-# hostname and adds two variables, and says nothing about the network or the
-# image, which must therefore survive untouched.
-if [ "$SCENARIO" = override ]; then
-  echo "==> writing /etc/vminit/override.json"
-  cat > "$TREE/etc/vminit/override.json" <<EOF
-{
-  "hostname": "$HOST",
-  "user_override": "$EXPECT_USER",
-  "extra_env": {
-    "OVERRIDDEN": "$EXPECT_OVERRIDDEN",
-    "FROM_OVERRIDE": "yes"
-  }
-}
-EOF
-fi
-
-echo "==> writing zpinit config"
+# The image's zpinit config, as a zpinit-native image carries it. Supervise
+# mode runs it; wrap mode ignores the services.
 install -d -m 0755 "$TREE/etc/zpinit/services" "$TREE/etc/zpinit/entrypoint.d"
 cat > "$TREE/etc/zpinit/zpinit.toml" <<'EOF'
-# Deliberately minimal. Everything image-derived reaches zpinit through the
-# service file and the environment vminit composes, never through OCI
-# awareness in zpinit itself.
 default_stop_signal = "SIGTERM"
-default_stop_timeout = "5s"
+default_stop_timeout = "3s"
 EOF
-
-# The service file vmpack will generate from entrypoint + cmd + user +
-# workdir. -hold keeps the machine up after reporting: with no VM mode in
-# zpinit yet, a service that exits takes PID 1 with it and panics the kernel.
-cat > "$TREE/etc/zpinit/services/10_probe.toml" <<EOF
-name = "probe"
-command = [
-  "/usr/local/bin/vmprobe",
-  "-hostname", "$HOST",
-  "-interface", "eth0",
-  "-address", "$GUEST_CIDR",
-  "-gateway", "$GW",
-  "-nameserver", "$NAMESERVER",
-  "-uid", "$EXPECT_UID",
-  "-gid", "$EXPECT_GID",
-$(printf '  "%s",\n' "${EXPECT_EXTRA_ENV[@]}")
-  "-env", "OVERRIDDEN=$EXPECT_OVERRIDDEN",
-  "-env", "HOME=$EXPECT_HOME",
-  "-http", "http://$GW:$HTTP_PORT/ping",
-  "-hold",
-]
-cwd = "/"
-user = "$EXPECT_USER"
-restart = "never"
-EOF
+{
+  echo 'name = "probe"'
+  echo 'command = ['
+  printf '  "%s",\n' "${PROBE_ARGV[@]}"
+  echo ']'
+  echo 'cwd = "/"'
+  echo "user = \"$PROBE_USER\""
+  echo 'restart = "never"'
+} > "$TREE/etc/zpinit/services/10_probe.toml"
 
 echo "==> building $OUT ($SIZE)"
 rm -f "$OUT"
 truncate -s "$SIZE" "$OUT"
-mkfs.ext4 -q -F -L vminit-test -d "$TREE" "$OUT"
+mkfs.ext4 -q -F -L vmsetup-test -d "$TREE" "$OUT"
 
-# The host side of the same set of variables, so boot.sh configures the TAP to
-# match the machine this rootfs expects instead of keeping its own copy. The
-# fixture already generates the vminit config and the probe's expectations from
-# one source; this extends that to the host, which is where the /32 scenario
-# needs a different setup rather than merely a different number.
-cat > "$DIR/net.env" <<EOF
+echo "==> writing the config blob"
+# What fctl composes per launch: everything resolved, nothing left to merge.
+# LAST_WINS appears twice to pin that a later entry wins.
+if [ "$MODE" = wrap ]; then
+  HANDOFF="\"command\": $(json_list "${PROBE_ARGV[@]}"),
+    \"user\": \"$PROBE_USER\",
+    \"working_dir\": \"/\",
+    \"stop_signal\": \"SIGTERM\",
+    \"stop_timeout\": \"$STOP_TIMEOUT\""
+else
+  HANDOFF="\"stop_signal\": \"SIGTERM\",
+    \"stop_timeout\": \"$STOP_TIMEOUT\""
+fi
+cat > "$DIR/config.json" <<EOF
+{
+  "hostname": "$HOST",
+  "handoff": {
+    $HANDOFF
+  },
+  "env": [
+    "PATH=/usr/local/bin:/usr/bin:/bin:/sbin",
+    "IMAGE_VAR=from-image",
+    "LAST_WINS=first",
+    "DEPLOY_ENV=prod",
+    "LAST_WINS=second"
+  ],
+  "network": {
+    "interfaces": [
+      { "name": "eth0", "mac": "$CONFIG_MAC", "address": "$GUEST_CIDR", "gateway": "$GW", "mmds": true }
+    ],
+    "nameservers": ["$NAMESERVER"],
+    "extra_hosts": [{ "ip": "10.0.0.5", "host": "db.internal" }]
+  },
+  "root": { "device": "$ROOT_DEVICE", "fstype": "ext4" },
+  "logging": { "target": "serial" }
+}
+EOF
+"$DIR/bin/mkblob" "${BLOB_FLAGS[@]}" "$DIR/config.json" "$BLOB"
+
+cat > "$DIR/scenario.env" <<EOF
 # generated by build-rootfs.sh, SCENARIO=$SCENARIO -- do not edit
+SCENARIO=$SCENARIO
 GUEST_IP=$GUEST_IP
 GUEST_CIDR=$GUEST_CIDR
 GUEST_MAC=$GUEST_MAC
@@ -243,10 +280,19 @@ GW=$GW
 HOST_CIDR=$HOST_CIDR
 ROUTED=$ROUTED
 HTTP_PORT=$HTTP_PORT
+CMDLINE_PARAM=$CMDLINE_PARAM
+WAIT_FOR='$WAIT_FOR'
+ACTION=$ACTION
+EXPECT_PROBE=$EXPECT_PROBE
+STAYS_UP=$STAYS_UP
+NEEDS_MACHINE_MODE=$NEEDS_MACHINE_MODE
+EXPECT_RESET='$EXPECT_RESET'
+MIN_STOP_SECS=$MIN_STOP_SECS
 EOF
 
 echo
-echo "rootfs:   $OUT"
-echo "hostname: $HOST"
-echo "guest:    $GUEST_CIDR via $GW (mac $GUEST_MAC)"
-echo "http:     http://$GW:$HTTP_PORT/ping"
+echo "scenario: $SCENARIO ($MODE mode)"
+echo "bundle:   $BUNDLE"
+echo "image:    $OUT"
+echo "config:   $BLOB (root $ROOT_DEVICE)"
+echo "guest:    $GUEST_CIDR via $GW (mac $GUEST_MAC, config says $CONFIG_MAC)"

@@ -12,11 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"os/user"
-	"sort"
 	"strconv"
 	"strings"
-
-	"github.com/0ploy/vminit/internal/config"
 )
 
 // User is a resolved user spec.
@@ -138,40 +135,26 @@ func lookupGroup(spec string) (int, error) {
 }
 
 // Env is a composed environment. It keeps insertion order so the value
-// handed to execve is deterministic for a given config, which matters for
-// vmpack's determinism requirement and for diffing boot logs.
+// handed to execve is deterministic for a given config, which keeps boot
+// logs diffable.
 type Env struct {
 	order []string
 	vals  map[string]string
 }
 
-// Compose builds the workload environment from the config layers. Precedence
-// runs lowest to highest: image.env, then extra_env, then anything MMDS
-// supplied. See PLAN.md §5.5.
-func Compose(cfg *config.Config, mmds map[string]string) *Env {
+// Compose builds an Env from the config's env list, which arrives final
+// (PLAN.md §5.5): there is no layering here. A repeated key keeps its first
+// position and its last value, which is how execve consumers would read the
+// same list anyway.
+func Compose(entries []string) *Env {
 	e := &Env{vals: map[string]string{}}
-	for _, entry := range cfg.Image.Env {
+	for _, entry := range entries {
 		k, v, _ := strings.Cut(entry, "=")
 		if k != "" {
 			e.Set(k, v)
 		}
 	}
-	for _, k := range sortedKeys(cfg.ExtraEnv) {
-		e.Set(k, cfg.ExtraEnv[k])
-	}
-	for _, k := range sortedKeys(mmds) {
-		e.Set(k, mmds[k])
-	}
 	return e
-}
-
-func sortedKeys(m map[string]string) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 // ApplyDefaults fills in the variables a container runtime would have

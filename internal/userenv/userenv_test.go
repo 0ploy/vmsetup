@@ -3,38 +3,18 @@ package userenv
 import (
 	"reflect"
 	"testing"
-
-	"github.com/0ploy/vminit/internal/config"
 )
 
-func TestComposePrecedence(t *testing.T) {
-	cfg := &config.Config{
-		Image:    config.Image{Env: []string{"PATH=/usr/bin", "A=image", "B=image"}},
-		ExtraEnv: map[string]string{"B": "extra", "C": "extra"},
-	}
-	env := Compose(cfg, map[string]string{"C": "mmds", "D": "mmds"})
-
-	want := []string{"PATH=/usr/bin", "A=image", "B=extra", "C=mmds", "D=mmds"}
+func TestComposeLastValueFirstPosition(t *testing.T) {
+	env := Compose([]string{"PATH=/usr/bin", "A=1", "B=1", "A=2"})
+	want := []string{"PATH=/usr/bin", "A=2", "B=1"}
 	if got := env.Slice(); !reflect.DeepEqual(got, want) {
 		t.Errorf("Slice() = %v, want %v", got, want)
 	}
 }
 
-func TestComposeKeepsFirstAppearanceOrder(t *testing.T) {
-	// Order has to be stable for a given config: vmpack's determinism
-	// requirement and readable boot-log diffs both depend on it.
-	cfg := &config.Config{
-		Image:    config.Image{Env: []string{"Z=1", "A=1"}},
-		ExtraEnv: map[string]string{"Y": "1", "B": "1"},
-	}
-	want := []string{"Z=1", "A=1", "B=1", "Y=1"}
-	if got := Compose(cfg, nil).Slice(); !reflect.DeepEqual(got, want) {
-		t.Errorf("Slice() = %v, want %v (image order, then extra_env sorted)", got, want)
-	}
-}
-
 func TestApplyDefaults(t *testing.T) {
-	env := Compose(&config.Config{}, nil)
+	env := Compose(nil)
 	env.ApplyDefaults(&User{Home: "/home/app"})
 
 	if got, _ := env.Get("HOME"); got != "/home/app" {
@@ -45,7 +25,7 @@ func TestApplyDefaults(t *testing.T) {
 	}
 
 	// An image that sets them keeps its own values.
-	set := Compose(&config.Config{Image: config.Image{Env: []string{"HOME=/root", "TERM=xterm"}}}, nil)
+	set := Compose([]string{"HOME=/root", "TERM=xterm"})
 	set.ApplyDefaults(&User{Home: "/home/app"})
 	if got, _ := set.Get("HOME"); got != "/root" {
 		t.Errorf("HOME = %q, want the image's /root", got)
