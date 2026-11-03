@@ -1,5 +1,5 @@
 // Package identity writes the three files a container runtime would have
-// written for you, and sets the hostname. See PLAN.md §5.4.
+// written for you, and sets the hostname. See SPEC.md §5.
 //
 // Docker's export leaves /etc/resolv.conf, /etc/hosts and /etc/hostname as
 // 0-byte regular files even for a `scratch` image, because the runtime

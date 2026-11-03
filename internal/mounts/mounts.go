@@ -1,6 +1,6 @@
 // Package mounts brings up the guest's filesystem hierarchy: devtmpfs and
 // /proc in the initramfs, the switch into the VM's disk, then the standard
-// table and the data volumes. See PLAN.md §5.2.
+// table and the data volumes. See SPEC.md §5.
 //
 // The table's ordering mirrors fly.io's init
 // (https://github.com/superfly/init-snapshot, src/bin/init/main.rs). Two deliberate departures: cgroup2 is mounted unified at
@@ -85,7 +85,7 @@ type Logger interface {
 func Dev(log Logger) error { return mountOne(log, dev) }
 
 // Proc mounts /proc in the initramfs, so /proc/cmdline can be read before the
-// config is known (PLAN.md §5.1).
+// config is known (SPEC.md §5).
 func Proc(log Logger) error { return mountOne(log, proc) }
 
 // EnsureRun makes /run a tmpfs in whatever root vmsetup is in, unless it
@@ -104,7 +104,7 @@ type Binary struct {
 	Name string // file name under binDir
 }
 
-// SwitchRoot mounts the VM's disk and makes it the root (PLAN.md §5.2):
+// SwitchRoot mounts the VM's disk and makes it the root (SPEC.md §5):
 //
 //	mount root on /newroot; check it is writable
 //	mount /newroot/run, then a tmpfs at /newroot<binDir>; copy bins in; remount it ro
@@ -201,7 +201,7 @@ func checkInitramfs() error {
 // installBins puts the bundle's binaries on a tmpfs of their own at dir, then
 // makes it read-only. They have to survive the switch, after which the
 // initramfs is unreachable, and they must come from the host rather than from
-// the workload's disk (PLAN.md §9).
+// the workload's disk (SPEC.md §11).
 func installBins(dir string, bins []Binary) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", dir, err)

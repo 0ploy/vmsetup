@@ -12,11 +12,11 @@
 # vmsetup, zpinit and zpctl come from the init bundle, as under fctl. The
 # image also carries a stub /usr/local/bin/zpinit that must never run.
 #
-# Scenarios (PLAN.md §11). Those marked [machine] need zpinit's machine mode
+# Scenarios (test/README.md). Those marked [machine] need zpinit's machine mode
 # (zpinit#10); run.sh skips them unless ZPINIT_MACHINE_MODE=1.
 #   base         supervise mode: the probe is a zpinit service; Ctrl+Alt+Del
 #                ends the VM.
-#   routed32     base, on fctl's routed /32 with a link-local gateway (§5.3).
+#   routed32     base, on fctl's routed /32 with a link-local gateway (SPEC.md §5).
 #   command      [machine] wrap mode: the probe is handoff.command, as an
 #                unprivileged user; it exits on its own -> cause=exit.
 #   stop         [machine] wrap mode, holding: Ctrl+Alt+Del -> stop_signal.
@@ -159,7 +159,7 @@ export CGO_ENABLED=0
 
 echo "==> building static binaries"
 # CGO_ENABLED=0 also makes os/user parse /etc/passwd directly instead of going
-# through NSS, which is the behaviour PLAN.md §5.5 specifies.
+# through NSS, which is the behaviour SPEC.md §5 specifies.
 ( cd "$REPO" && go build -trimpath -ldflags "-s -w -X main.version=test" -o "$DIR/bin/vmsetup" ./cmd/vmsetup )
 ( cd "$REPO" && go build -trimpath -o "$DIR/bin/mkbundle" ./cmd/mkbundle )
 ( cd "$REPO" && go build -trimpath -ldflags "-s -w" -o "$DIR/bin/vmprobe" ./test/probe )

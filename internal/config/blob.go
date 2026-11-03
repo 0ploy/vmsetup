@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-// The config blob, PLAN.md §4.1:
+// The config blob, SPEC.md §4.1:
 //
 //	offset  0   "FCTLCFG\0"   8 bytes, magic
 //	offset  8   version       u32 little-endian

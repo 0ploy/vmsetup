@@ -5,7 +5,7 @@
 // zpinit, which is PID 1 for the life of the VM.
 //
 // It manages no process at any point: no fork, no reaping, no stop handling.
-// See PLAN.md.
+// See SPEC.md.
 package main
 
 import (

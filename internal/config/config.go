@@ -1,5 +1,5 @@
 // Package config defines the guest config: the one JSON document fctl
-// composes for each launch and vmsetup reads at boot. See PLAN.md §4.
+// composes for each launch and vmsetup reads at boot. See SPEC.md §4.
 //
 // vmsetup owns the schema and fctl writes it. Drift between the writer and the
 // reader is the likeliest bug in the design, so the document carries only
@@ -20,7 +20,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Config is the whole guest config, PLAN.md §4.2.
+// Config is the whole guest config, SPEC.md §4.2.
 type Config struct {
 	Hostname string `json:"hostname,omitempty"`
 
@@ -34,21 +34,21 @@ type Config struct {
 	Network Network `json:"network"`
 
 	// Root is the VM's disk. vmsetup mounts it and switches root into it
-	// (PLAN.md §5.2).
+	// (SPEC.md §5).
 	Root Root `json:"root"`
 
 	// Mounts are extra data volumes, mounted after the standard table.
 	Mounts []Mount `json:"mounts,omitempty"`
 
 	// Exec, when set, is passed to zpinit, which listens for exec requests
-	// over vsock. Absent means no listener. PLAN.md §6.1.
+	// over vsock. Absent means no listener. zpinit#10.
 	Exec *Exec `json:"exec,omitempty"`
 
 	Logging Logging `json:"logging"`
 }
 
 // Handoff is fully resolved by fctl: Docker's --entrypoint / --user / -w /
-// command semantics have already been applied host-side (PLAN.md §8.1).
+// command semantics have already been applied host-side (SPEC.md §10.1).
 //
 // Command decides zpinit's mode. Present: wrap mode, zpinit runs it as its
 // one child, as User in WorkingDir. Absent: supervise mode, the image's own
@@ -124,7 +124,7 @@ type LogTarget string
 
 const (
 	// LogSerial writes to /dev/ttyS0, which Firecracker forwards to a
-	// per-VM file on the host. Works without console= (PLAN.md §7.2).
+	// per-VM file on the host. Works without console= (SPEC.md §9).
 	LogSerial LogTarget = "serial"
 	LogNone   LogTarget = "none"
 )
@@ -178,7 +178,7 @@ func Parse(doc []byte) (*Config, error) {
 
 // Validate rejects a document that cannot produce a correct machine, naming
 // the field. Every violation is a host-side composition bug; vmsetup parks on
-// it (PLAN.md §4.2, principle 5).
+// it (SPEC.md §4.3, principle 5).
 //
 // Nothing is defaulted. Every field anything acts on arrives resolved, and a
 // required field that is missing is an error rather than a guess.

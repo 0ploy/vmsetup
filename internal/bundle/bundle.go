@@ -1,5 +1,5 @@
 // Package bundle writes the init bundle as a reproducible newc cpio
-// (PLAN.md §8.2). It implements just the subset of the format the kernel's
+// (SPEC.md §10.2). It implements just the subset of the format the kernel's
 // initramfs unpacker needs: directories, regular files and one device node.
 package bundle
 

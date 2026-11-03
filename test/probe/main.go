@@ -1,6 +1,6 @@
 // Command vmprobe is the test payload for the boot matrix. It runs inside the
 // guest -- as a zpinit service, or as zpinit's wrap-mode command -- and
-// checks, from the inside, that vmsetup actually did what PLAN.md §5 says.
+// checks, from the inside, that vmsetup actually did what SPEC.md §5 and §6 say.
 //
 // Everything it needs to know about the expected machine arrives on the
 // command line, so test/build-rootfs.sh can generate the guest config and
@@ -93,7 +93,7 @@ func main() {
 	mounts := readMounts()
 	fmt.Printf("PROBE info root                         %s\n", mounts["/"].opts)
 	// The root is the VM's own disk, writable, switched into from the
-	// initramfs (PLAN.md §5.2).
+	// initramfs (SPEC.md §5).
 	root, ok := mounts["/"]
 	c.check("root is the writable disk", ok && root.fstype == "ext4" && strings.HasPrefix(root.opts, "rw"), describe(root, ok, "ext4"))
 	// The bundle's zpinit and zpctl, on a read-only tmpfs of their own.
@@ -109,7 +109,7 @@ func main() {
 	_, err := os.Stat("/init")
 	c.check("no initramfs leftovers in /", os.IsNotExist(err), fmt.Sprintf("%v", err))
 
-	// The standard table from PLAN.md §5.2. devtmpfs on /dev has to be
+	// The standard table from SPEC.md §5. devtmpfs on /dev has to be
 	// there for any of the rest to mean anything.
 	for _, want := range []struct{ path, fstype string }{
 		{"/dev", "devtmpfs"},
@@ -176,7 +176,7 @@ func main() {
 		got, present := os.LookupEnv(k)
 		c.check("env "+k, present && got == v, fmt.Sprintf("%q (want %q)", got, v))
 	}
-	// HOME and TERM are what a container runtime would have supplied; §5.5
+	// HOME and TERM are what a container runtime would have supplied; SPEC.md §5
 	// makes vmsetup supply them.
 	for _, k := range []string{"HOME", "TERM", "PATH"} {
 		v, present := os.LookupEnv(k)
@@ -196,7 +196,7 @@ func main() {
 	c.check("uid", os.Getuid() == *uid, strconv.Itoa(os.Getuid()))
 	c.check("gid", os.Getgid() == *gid, strconv.Itoa(os.Getgid()))
 
-	// vmsetup execs zpinit (PLAN.md §5.6), so PID 1 is zpinit and the
+	// vmsetup execs zpinit (SPEC.md §6), so PID 1 is zpinit and the
 	// expected process tree is probe -> zpinit(1).
 	got := ancestors()
 	c.check("process chain", got == *chain, fmt.Sprintf("%q (want %q)", got, *chain))

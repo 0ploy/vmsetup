@@ -1,5 +1,5 @@
 // Command mkbundle builds the init bundle: the uncompressed newc cpio fctl
-// attaches as initrd_path on every boot (PLAN.md §8.2).
+// attaches as initrd_path on every boot (SPEC.md §10.2).
 //
 //	/init          vmsetup
 //	/bin/zpinit    zpinit, with machine mode

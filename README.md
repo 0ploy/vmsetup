@@ -24,8 +24,9 @@ go test ./...                            # unit tests, no KVM needed
 sudo KERNEL=/path/to/vmlinux ZPINIT=/path/to/zpinit test/run.sh   # boot matrix, needs KVM
 ```
 
-See [PLAN.md](PLAN.md) for the design and spec, and
-[docs/RESEARCH.md](docs/RESEARCH.md) for the findings it rests on.
+See [SPEC.md](SPEC.md) for the spec,
+[docs/RESEARCH.md](docs/RESEARCH.md) for the findings it rests on, and
+[test/README.md](test/README.md) for the boot matrix.
 
 ## Why this exists
 

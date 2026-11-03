@@ -1,6 +1,6 @@
 # Research notes
 
-Findings behind the decisions in [../PLAN.md](../PLAN.md), recorded so nobody
+Findings behind the decisions in [../SPEC.md](../SPEC.md), recorded so nobody
 has to re-derive them. **[VERIFIED]** means tested on real hardware: Linux
 x86_64 (AMD), Firecracker v1.16.1–v1.17.0, guest kernel 6.18.39.
 
@@ -55,7 +55,7 @@ IPv4 only, effectively one interface, and does **not** write
 the routed `/32` every VM gets: `ipconfig` initialises its netmask to
 `INADDR_NONE`, so a `/32` is indistinguishable from "unset". vmsetup
 configures the interface over netlink, and a VM whose network bringup failed
-is reached over exec, not a debug NIC (PLAN.md §7.2).
+is reached over exec, not a debug NIC (SPEC.md §9).
 
 ---
 
@@ -124,7 +124,7 @@ flush. PID 1 calls `reboot(LINUX_REBOOT_CMD_CAD_OFF)` to opt out, after which
 the kernel delivers **SIGINT to PID 1** instead [VERIFIED]. In the VM that is
 zpinit's machine mode. A Ctrl+Alt+Del sent before the guest's i8042/atkbd
 driver has finished probing is lost [VERIFIED], so the host resends
-(PLAN.md §5.7).
+(SPEC.md §8, and §8 below).
 
 There is no ACPI power button. On aarch64 there is no i8042 at all, so an
 aarch64 port needs a different trigger.
@@ -133,7 +133,7 @@ aarch64 port needs a different trigger.
 
 ## 5. MMDS
 
-An in-guest MMDS agent is deferred (PLAN.md §12). What it would have to deal
+An in-guest MMDS agent is deferred ([future.md](future.md#an-mmds-agent)). What it would have to deal
 with, if built:
 
 - **Mutability is the whole point.** `PUT /mmds` replaces and `PATCH /mmds`
@@ -141,7 +141,7 @@ with, if built:
   channel that can reconfigure a live VM without a reboot.
 - **Bootstrapping.** MMDS is reached *over the network*, but the thing most
   needed at boot is the network configuration. So boot-critical config arrives
-  on the config blob (PLAN.md §4.1), and an agent must never be on the
+  on the config blob (SPEC.md §4.1), and an agent must never be on the
   critical path to a working network.
 - **No push notification.** The guest polls, so any poll interval is a latency
   floor on every live reconfiguration. Push over exec does the job better,
@@ -221,12 +221,12 @@ deliberate fakes; a container can only fool its own `/proc`.
 | Option | Why not |
 | --- | --- |
 | The bringup binary stays PID 1 and forks zpinit (or the workload) | Two process managers per VM: two reapers, two stop sequences, and two stop timeouts that have to nest. Bringup is not process management |
-| A fallback lifecycle in vmsetup for when zpinit cannot be exec'd | The same mistake, kept for a host-side bug. A broken bundle parks and reboots instead (PLAN.md §6.2) |
+| A fallback lifecycle in vmsetup for when zpinit cannot be exec'd | The same mistake, kept for a host-side bug. A broken bundle parks and reboots instead (SPEC.md §7) |
 | `execve` the bare workload as PID 1, no zpinit | PID 1 gets no default signal dispositions (a workload without a `SIGTERM` handler ignores the stop), nothing reaps orphans, nothing reports the exit status, and the workload's exit panics the kernel |
 | Handoff "profiles" for distro images (`cloud-init`, `systemd`, `openrc`) with generated network config | Distro images boot without the init bundle. MMDS is already EC2-shaped, so cloud-init's Ec2 datasource configures an Ubuntu cloud image with no guest init of ours |
 | A `--vm` flag on zpinit | A flag can be set by mistake in a container. Detection cannot |
 | Guest binaries baked into the image | The workload owns its writable disk and would own the next boot |
-| `pivot_root` for the switch | It refuses the initramfs, which is the rootfs mount itself; `MS_MOVE` + `chroot` is the standard `switch_root` (PLAN.md §5.2) |
+| `pivot_root` for the switch | It refuses the initramfs, which is the rootfs mount itself; `MS_MOVE` + `chroot` is the standard `switch_root`, as busybox and klibc do it |
 
 ### Why Go is fine for vmsetup despite the runtime
 
@@ -254,6 +254,43 @@ for a container image.
 - **firecracker-containerd**: a devmapper snapshotter exposing container images
   as block devices, and an in-guest agent that runs the workload in a PID
   namespace.
+
+---
+
+## 8. Boot-test findings
+
+From the boot matrix ([../test/README.md](../test/README.md)), Firecracker
+v1.17.0, guest kernel 6.18.39.
+
+- **The default route needs `onlink` under a `/32`** [VERIFIED]. fctl gives
+  each VM one routed address with no on-link subnet, and a link-local gateway
+  every tap on the host carries: one address per VM instead of the four a
+  `/30` burns. The gateway is then inside no connected prefix, and with the
+  flag disabled the `routed32` scenario fails:
+  `add default route via 169.254.0.1 on eth0: network is unreachable`.
+  `RTNH_F_ONLINK` tells the kernel the nexthop is directly reachable, which it
+  is: the tap is point-to-point with the host.
+- **In an initramfs the kernel does not mount devtmpfs** [VERIFIED].
+  `CONFIG_DEVTMPFS_MOUNT` acts only when the kernel mounts a root device
+  itself, so vmsetup mounts it first thing.
+- **`EBUSY` is not "done"** [VERIFIED]. Booted from a root drive, where the
+  kernel *does* automount devtmpfs, treating `EBUSY` as already-mounted lost
+  `nosuid` on `/dev`. vmsetup adopts the existing mount and re-applies the
+  flags with `MS_REMOUNT|MS_BIND`, which changes per-mount flags without
+  touching the superblock: devtmpfs is one kernel-wide instance.
+- **`pivot_root` refuses the initramfs.** It is the rootfs mount itself and
+  cannot be unmounted, hence `MS_MOVE` + `chroot`.
+- **An undotted cmdline parameter reaches `/proc/cmdline` unchanged**
+  [VERIFIED]. Dotted ones are module parameters and may never reach init, hence
+  `vmsetup_config=`, not `vmsetup.config=`.
+- **Serial lines arrive as `\r\n`** [VERIFIED]: the tty's `ONLCR` translates
+  every `\n`. The harness's first matcher failed on exactly this.
+- **A Ctrl+Alt+Del sent ~0.65 s after the VMM starts is lost** [VERIFIED]. The
+  initramfs boot reaches `/init` before the i8042/atkbd probe (~510 ms on this
+  kernel) finishes, and the event goes nowhere. A resend 1 s later works.
+- **Timing** [VERIFIED]: measured from the host, the probe reports ~0.43 s
+  after the Firecracker process starts. vmsetup itself, `/init` to `execve`, takes
+  21–35 ms, of which the switch root is ~8 ms.
 
 ---
 

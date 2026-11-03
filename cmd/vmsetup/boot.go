@@ -19,7 +19,7 @@ import (
 	"github.com/0ploy/vmsetup/internal/vmlog"
 )
 
-// Park steps, PLAN.md §6.2. fctl surfaces them, so they are protocol.
+// Park steps, SPEC.md §7. fctl surfaces them, so they are protocol.
 const (
 	stepConfig   = "config"
 	stepRoot     = "root"
@@ -30,7 +30,7 @@ const (
 	stepHandoff  = "handoff"
 )
 
-// The init bundle's layout, PLAN.md §8.2.
+// The init bundle's layout, SPEC.md §10.2.
 const (
 	bundleZpinit = "/bin/zpinit"
 	bundleZpctl  = "/bin/zpctl"
@@ -77,7 +77,7 @@ func boot() {
 
 	s.log = vmlog.New()
 
-	// §5.1. Nothing here depends on the config.
+	// /dev, the console and /proc. Nothing here depends on the config.
 	if err := mounts.Dev(s.log); err != nil {
 		s.park(stepConfig, err)
 	}
@@ -136,7 +136,7 @@ func loadConfig() (*config.Config, error) {
 	return config.Parse(doc)
 }
 
-// bringup runs §5.2 to §5.6 in the new root. It returns the step that failed.
+// bringup prepares the new root (SPEC.md §5) and writes the handoff files (§6). It returns the step that failed.
 func (s *setup) bringup() (string, error) {
 	cfg := s.cfg
 
@@ -192,7 +192,7 @@ func (s *setup) bringup() (string, error) {
 	return "", nil
 }
 
-// handoff execs zpinit (PLAN.md §5.6). It returns only by parking.
+// handoff execs zpinit (SPEC.md §6). It returns only by parking.
 func (s *setup) handoff() {
 	h := s.cfg.Handoff
 	path := machine.BinDir + "/zpinit"
@@ -211,7 +211,7 @@ func (s *setup) handoff() {
 }
 
 // park reports a bringup failure and hands the broken machine to zpinit's
-// rescue mode, where it stays up to be inspected (PLAN.md §6.2). It never
+// rescue mode, where it stays up to be inspected (SPEC.md §7). It never
 // returns.
 func (s *setup) park(step string, err error) {
 	if !s.log.Attached() {
@@ -267,7 +267,7 @@ func (s *setup) park(step string, err error) {
 
 // giveUp ends the VM when there is no zpinit to hand it to: a bundle built
 // wrong, a host-side bug. vmsetup does not stay to reap or wait for a stop,
-// because that would be process management (PLAN.md §6.2).
+// because that would be process management (SPEC.md §7).
 func (s *setup) giveUp(err error) {
 	s.log.Errorf("cannot hand the machine to zpinit: %v; rebooting", err)
 	unix.Sync()
@@ -281,7 +281,7 @@ func (s *setup) giveUp(err error) {
 	}
 }
 
-// setupStdio points PID 1's stdio somewhere real (PLAN.md §5.1): fd 0 at
+// setupStdio points PID 1's stdio somewhere real (SPEC.md §5): fd 0 at
 // /dev/null, fds 1 and 2 at the console, or /dev/null without one. Production
 // boots without console=, so the kernel may hand init closed descriptors, and
 // a process inheriting a closed fd 1 gets it assigned to the first file it

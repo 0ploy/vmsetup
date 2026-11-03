@@ -1,5 +1,5 @@
 // Package userenv resolves the image's USER to numeric ids and composes the
-// environment the workload will run with. See PLAN.md §5.5.
+// environment the workload will run with. See SPEC.md §5.
 //
 // Build with CGO_ENABLED=0. Go's os/user then uses its pure-Go
 // implementation, which parses /etc/passwd and /etc/group directly. That is
@@ -143,7 +143,7 @@ type Env struct {
 }
 
 // Compose builds an Env from the config's env list, which arrives final
-// (PLAN.md §5.5): there is no layering here. A repeated key keeps its first
+// (SPEC.md §5): there is no layering here. A repeated key keeps its first
 // position and its last value, which is how execve consumers would read the
 // same list anyway.
 func Compose(entries []string) *Env {

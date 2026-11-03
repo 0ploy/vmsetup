@@ -1,6 +1,6 @@
 // Package machine writes what vmsetup hands zpinit besides argv, envp and the
 // working directory: /run/zpinit/machine.json and /run/zpinit/env. See
-// PLAN.md §5.5 and §5.6.
+// SPEC.md §5 and §6.
 //
 // zpinit owns both formats (zpinit#10); vmsetup is the writer that runs
 // before it. zpinit reads machine.json only in machine mode, so nothing here
@@ -26,7 +26,7 @@ const (
 	// EnvPath is the env file zpinit merges before every entrypoint.d script.
 	EnvPath = Dir + "/env"
 	// BinDir holds the bundle's zpinit and zpctl after the switch root, on a
-	// read-only tmpfs of its own (PLAN.md §5.2).
+	// read-only tmpfs of its own (SPEC.md §5).
 	BinDir = Dir + "/bin"
 	// RescueConfigDir is the empty zpinit config directory a parked machine
 	// boots zpinit with, so a broken image config cannot also break rescue.
@@ -36,7 +36,7 @@ const (
 // Version is the machine.json format version this vmsetup writes.
 const Version = 1
 
-// Settings is machine.json, PLAN.md §5.6.
+// Settings is machine.json, SPEC.md §6.
 type Settings struct {
 	V int `json:"v"`
 	// Console is where zpinit writes the reset line, even with logging off.
@@ -122,7 +122,7 @@ func EnvFile(env []string) (content string, skipped []string) {
 //
 // The file equals envp, so zpinit's merge of it above the container-env tier
 // changes no value; it exists so entrypoint.d scripts can see the env and
-// append to it (PLAN.md §5.5).
+// append to it (SPEC.md §6).
 func WriteEnv(env []string) ([]string, error) {
 	content, skipped := EnvFile(env)
 	return skipped, writePrivate(EnvPath, []byte(content))

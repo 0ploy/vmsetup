@@ -1,5 +1,5 @@
 // Command mkblob turns a JSON config document into the raw config device
-// vmsetup reads (PLAN.md §4.1). It is the test fixture's stand-in for fctl's
+// vmsetup reads (SPEC.md §4.1). It is the test fixture's stand-in for fctl's
 // encoder, and uses the same package vmsetup decodes with, so the two cannot
 // disagree about the format.
 //

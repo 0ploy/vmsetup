@@ -1,5 +1,4 @@
-// Package netconf configures the guest's network over netlink. See PLAN.md
-// §5.3.
+// Package netconf configures the guest's network over netlink. See SPEC.md §5.
 //
 // A microVM has no shared namespace for the host to reach into, so unlike a
 // container nobody configures this from the outside: the address, the route
@@ -162,7 +161,7 @@ func findLink(iface config.Interface) (netlink.Link, error) {
 // route add fails with ENETUNREACH ("nexthop has invalid gateway"). ONLINK
 // tells the kernel to treat it as directly reachable, which it genuinely is:
 // the tap is point-to-point with the host on the other end. Verified end to
-// end by the routed32 boot scenario (PLAN.md §5.3, §11).
+// end by the routed32 boot scenario (SPEC.md §5; docs/RESEARCH.md §8).
 //
 // The flag is set only when the configured address really does not cover the
 // gateway. On a conventional subnet a mistyped gateway still fails loudly at

@@ -21,7 +21,7 @@ set -uo pipefail
 
 DIR=$(cd "$(dirname "$0")" && pwd)
 # The guest kernel is fctl's (github.com/0ploy/fctl builds it); point at one.
-KERNEL=${KERNEL:?set KERNEL to a guest vmlinux with CONFIG_BLK_DEV_INITRD (PLAN.md §7.1)}
+KERNEL=${KERNEL:?set KERNEL to a guest vmlinux with CONFIG_BLK_DEV_INITRD (SPEC.md §9)}
 ROOTFS=${ROOTFS:-$DIR/rootfs.ext4}
 BLOB=${BLOB:-$DIR/config.blob}
 BUNDLE=${BUNDLE:-$DIR/init.cpio}

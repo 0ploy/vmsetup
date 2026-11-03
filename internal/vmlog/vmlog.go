@@ -4,12 +4,12 @@
 // The awkward part it exists to solve: vmsetup may have to log before it can
 // log. In the initramfs /dev is empty until vmsetup mounts devtmpfs, and
 // PID 1's inherited stdio is no help either, because production boots
-// without console= (PLAN.md §7.2).
+// without console= (SPEC.md §9).
 //
 // So the logger starts out buffering, tees to stderr in case something is
 // listening there, and is switched onto the real serial port by Attach as
 // soon as /dev is known to be up. Anything logged before that point is
-// flushed at that moment rather than lost (PLAN.md §5.1).
+// flushed at that moment rather than lost (SPEC.md §5).
 package vmlog
 
 import (
@@ -158,7 +158,7 @@ func (l *Logger) emit(level, format string, args ...any) {
 func (l *Logger) Elapsed() time.Duration { return time.Since(l.start) }
 
 // Sentinel writes one protocol line to the serial port for the host to match:
-// the park line (PLAN.md §6.2). It is not a log line: it is written whatever
+// the park line (SPEC.md §7). It is not a log line: it is written whatever
 // logging.target says, it carries no timestamp prefix, and it starts with a
 // newline so a partial line from the workload cannot swallow it.
 //
