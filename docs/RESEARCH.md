@@ -1,24 +1,12 @@
 # Research notes
 
-Findings behind the decisions in [../PLAN.md](../PLAN.md). Recorded so the
-implementation session does not have to re-derive them.
+Findings behind the decisions in [../PLAN.md](../PLAN.md), recorded so nobody
+has to re-derive them. **[VERIFIED]** means tested on real hardware: Linux
+x86_64 (AMD), Firecracker v1.16.1–v1.17.0, guest kernel 6.18.39.
 
-Everything here was established on macOS in August 2026 against Firecracker
-`main`, Docker 29.6.2, and the fly.io init snapshot. **Nothing involving a
-running microVM could be tested** — no KVM on macOS. Claims that need
-verification on real hardware are marked **[UNVERIFIED]**.
-
-> **Scope, since 2026-08-06.** Host-side research now lives in
-> [fctl/docs/RESEARCH.md](../../fctl/docs/RESEARCH.md) — the VMM, the kernel
-> command line, guest kernel builds, serial/console configuration, host-side
-> shutdown mechanics, and boot-time measurement. What remains here is what
-> vminit does *inside* the guest. Several sections below were split on that
-> line and now carry a pointer to their other half.
->
-> Findings marked **[VERIFIED]** anywhere in this workspace were established on
-> a Linux x86_64 (AMD) host, Firecracker v1.16.1, guest kernel 6.18.39 with the
-> Ubuntu 24.04 CI rootfs — and with **stock systemd as PID 1, not vminit**.
-> That caveat applies to every guest-side conclusion drawn from them.
+Host-side findings (the VMM, the kernel command line, guest kernel builds,
+serial configuration, boot-time measurement) belong to
+[fctl](https://github.com/0ploy/fctl). These are the guest-side ones.
 
 ---
 
@@ -45,15 +33,15 @@ ip route add default via 172.16.0.1 dev eth0
 `scratch` has no iproute2. Alpine has busybox `ip`, which differs from
 Debian's. Depending on any of this makes the tool image-dependent.
 
-`ip(8)` is a thin wrapper over an `AF_NETLINK` socket. fly's init skips the
-binary entirely — `fly-io-init/src/bin/init/main.rs:625-696` opens a netlink
-connection and issues `RTM_SETLINK` / `RTM_NEWADDR` / `RTM_NEWROUTE` directly.
-Because the init is a **static binary we ship**, the guest's distro is
-irrelevant. That is the whole trick.
+`ip(8)` is a thin wrapper over an `AF_NETLINK` socket. fly.io's init
+([init-snapshot](https://github.com/superfly/init-snapshot)) skips the binary
+entirely: it opens a netlink connection and issues `RTM_SETLINK`,
+`RTM_NEWADDR` and `RTM_NEWROUTE` directly. Because the init is a **static
+binary we ship**, the guest's distro is irrelevant. That is the whole trick.
 
 Go equivalent: `github.com/vishvananda/netlink`, pure Go, no cgo.
 
-### Kernel `ip=` as a fallback
+### Kernel `ip=` — rejected
 
 The guest kernel can configure one interface before init runs:
 
@@ -61,38 +49,20 @@ The guest kernel can configure one interface before init runs:
 ip=<client-ip>:<server-ip>:<gw-ip>:<netmask>:<hostname>:<device>:<autoconf>:<dns0-ip>:<dns1-ip>
 ```
 
-Confirmed `CONFIG_IP_PNP=y`, `CONFIG_IP_PNP_DHCP=y`, `CONFIG_IP_PNP_BOOTP=y`
-in **every** Firecracker reference guest config, both arches, 5.10 through
-6.18 (`resources/guest_configs/microvm-kernel-ci-*.config`).
-
-Limits: IPv4 only, effectively one interface, and it does **not** write
-`/etc/resolv.conf` — DNS servers land in `/proc/net/pnp` instead. The classic
-trick is symlinking `/etc/resolv.conf → /proc/net/pnp`, whose format is
-resolver-compatible.
-
-Useful as belt-and-braces, and essential for future systemd-passthrough mode.
-Not sufficient as the primary mechanism.
-
-Whether `ip=` is actually passed is [fctl](../../fctl)'s decision, since it
-owns the cmdline. vminit must work with or without it, and must not assume the
-interface is already up.
+`CONFIG_IP_PNP` is set in every Firecracker reference guest config. But it is
+IPv4 only, effectively one interface, and does **not** write
+`/etc/resolv.conf` (DNS servers land in `/proc/net/pnp`). And it cannot express
+the routed `/32` every VM gets: `ipconfig` initialises its netmask to
+`INADDR_NONE`, so a `/32` is indistinguishable from "unset". vmsetup
+configures the interface over netlink, and a VM whose network bringup failed
+is reached over exec, not a debug NIC (PLAN.md §7.2).
 
 ---
 
-## 2. What Docker's export actually contains
+## 2. What Docker's export contains
 
-Tested against `nginx:alpine` and a `scratch` image built from busybox.
-
-### Layer flattening works
-
-`docker export` of a **created but never started** container flattens all
-layers and resolves whiteouts. Verified: zero `.wh.` entries remained in the
-`nginx:alpine` export. So layer-merge logic is not strictly required *if* you
-go through the daemon — but see §3 for why you should not.
-
-### Docker injects synthetic files, even into `scratch`
-
-Full contents of the `scratch` image export:
+Tested against `nginx:alpine` and a `scratch` image built from busybox. Docker
+injects synthetic files, even into `scratch`:
 
 ```
 -rwxr-xr-x  0  .dockerenv
@@ -111,285 +81,179 @@ drwxr-xr-x  0  sys/
 ```
 
 The three `/etc` files are empty because Docker bind-mounts them at runtime. In
-a VM nothing mounts over them, so **DNS silently fails unless vminit writes
-them**. `/dev/console` being a regular file is shadowed once devtmpfs is
-mounted over `/dev`, but should be cleaned anyway.
-
-### Symlink density
-
-Alpine is roughly 400 busybox symlinks (`bin/cat -> /bin/busybox`); Debian is
-usrmerge (`/lib -> /usr/lib`). Extraction must preserve symlinks and hardlinks
-faithfully and must not follow them.
+a VM nothing mounts over them, so **DNS silently fails unless vmsetup writes
+them**. The fake `/dev/console` is shadowed once devtmpfs is mounted over
+`/dev`. An image built straight from OCI layers has none of these, and vmsetup
+handles both.
 
 ---
 
-## 3. Do not build on the Docker daemon
+## 3. Console and logging
 
-On Docker 29.6.2 with the containerd image store, after
-`docker pull --platform linux/amd64 nginx:alpine` on an arm64 host:
+On x86_64 Firecracker creates COM1 unconditionally, so `/dev/ttyS0` is present
+and writable from guest userspace whether or not `console=` is on the cmdline
+[VERIFIED]. With `console=` absent no getty claims the port, so the guest has it
+to itself. vmsetup (for its log and park line) and zpinit (for the reset line)
+therefore open `/dev/ttyS0` directly and never assume a console device.
 
-```
-$ docker image inspect nginx:alpine
-  → "Config": {}          ← silently empty, no error, exit 0
+The port is rate-limited by the host (Firecracker applies a token bucket), so
+writes can be silently dropped: serial is not a reliable channel, which is why
+nothing the host acts on strongly travels over it.
 
-$ docker image inspect --platform linux/amd64 nginx:alpine
-  → full config
-
-$ docker save nginx:alpine -o img.tar
-  → Error: unable to create manifests file: NotFound: content digest
-    sha256:1dd3048a... not found
-```
-
-An empty config with a zero exit code is the worst possible failure mode: the
-resulting VM would boot with no entrypoint, no env, and no user, and the
-packer would report success.
-
-Use `skopeo` or `crane` against the registry, resolve the index to the
-platform manifest explicitly, and read the config blob. Also removes the
-daemon as a build dependency.
+Upstream's own performance boot args include `8250.nr_uarts=0`, which removes
+the port entirely. If that is ever adopted, logging and the park and reset
+lines have to move to vsock.
 
 ---
 
-## 4. Console and logging — the guest half
+## 4. Shutdown
 
-**Moved.** The console, serial and boot-time research is host-side and now
-lives in [fctl/docs/RESEARCH.md §2](../../fctl/docs/RESEARCH.md) — including
-the verified result that `PUT /serial` works with `console=` absent on x86_64,
-the measured cost of `console=`, and the fact that `serial_out_path` cannot be
-set from a config file.
+Firecracker **exits the VMM process on CPU reset**. So a guest ends its own VM
+by calling `reboot(RB_AUTOBOOT)` with `reboot=k` on the cmdline, as fly.io's
+init does.
 
-What matters for vminit, in one paragraph:
-
-`logging.target = "serial"` (§4.2 of PLAN.md) is sound. On x86_64 Firecracker
-creates COM1 unconditionally, so `/dev/ttyS0` is present and writable from
-guest userspace whether or not `console=` is on the cmdline — **verified**.
-Better still, with `console=` absent no getty claims the port, so vminit has it
-to itself. vminit should therefore open `/dev/ttyS0` directly and never assume
-a console device, and it must tolerate the port being rate-limited by the host
-(Firecracker applies a `TokenBucket`, so writes can be silently dropped —
-do not treat serial as a reliable channel).
-
-One dependency to be aware of: upstream's own performance boot args include
-`8250.nr_uarts=0`, which removes the port entirely. If fctl ever adopts that,
-serial logging dies and the log path has to become vsock.
-
----
-
-## 5. Shutdown — the guest half
-
-Host-side mechanics (how `SendCtrlAltDel` is delivered, the i8042 dependency,
-and the two ways to lose graceful shutdown silently) are in
-[fctl/docs/RESEARCH.md §3](../../fctl/docs/RESEARCH.md). What vminit must do
-about it:
-
-Firecracker **exits the VMM process on CPU reset**. So a guest terminates its
-own VM by calling `reboot(RB_AUTOBOOT)` — this is what fly does
-(`fly-io-init/src/bin/init/main.rs:879-881`).
-
-Conversely, if PID 1 merely exits, the kernel panics with
-`Attempted to kill init!` and the VM hangs until killed externally. **vminit
-must never return from PID 1.** Its terminal action is always a `reboot()`.
+If PID 1 merely exits, the kernel panics with `Attempted to kill init!`.
+**PID 1 must never return**; its terminal action is always a `reboot()`. That
+is why zpinit's machine mode turns every exit path into sync and reboot, and
+why vmsetup, while it is PID 1, catches every signal and reboots when it has
+no zpinit to hand over to.
 
 `SendCtrlAltDel` arrives as an i8042 keyboard event. By default the **kernel**
 handles it with an immediate hard reset, which gives the workload no chance to
-flush. PID 1 must call `reboot(LINUX_REBOOT_CMD_CAD_OFF)` at startup to opt
-out, after which the kernel delivers **SIGINT to PID 1** instead — see PLAN.md
-§5.6. That SIGINT path is the half of graceful shutdown this repo owns, and it
-is **untested**: the hardware verification on 2026-08-06 ran against stock
-systemd, not vminit.
+flush. PID 1 calls `reboot(LINUX_REBOOT_CMD_CAD_OFF)` to opt out, after which
+the kernel delivers **SIGINT to PID 1** instead [VERIFIED]. In the VM that is
+zpinit's machine mode. A Ctrl+Alt+Del sent before the guest's i8042/atkbd
+driver has finished probing is lost [VERIFIED], so the host resends
+(PLAN.md §5.7).
 
-There is no ACPI power button. On aarch64 there is no i8042 at all, so a
-future aarch64 port needs a different trigger.
-
----
-
-## 6. MMDS — the guest half
-
-Host-side configuration (attaching MMDS to `eth0` rather than a dedicated TAP,
-enforcing V2, and the fact that it cannot be added to a VM that booted without
-it) is in [fctl/docs/RESEARCH.md §5](../../fctl/docs/RESEARCH.md). What the
-vminit agent has to deal with:
-
-### Mutability is the whole point
-
-MMDS is a store inside the Firecracker process. `PUT /mmds` replaces,
-`PATCH /mmds` merges (RFC 7396 JSON Merge Patch) — **at any time, including
-while the VM is running**. That is the only channel that can reconfigure a live
-VM without a reboot, which is why `vminit agent` exists at all.
-
-### The bootstrapping problem
-
-MMDS is reached *over the network*, but the thing most needed at boot is the
-network configuration. Hence the split in PLAN.md §4.1: boot-critical config
-comes from a file baked into the rootfs; MMDS handles only what must change on
-a live VM. The agent must therefore never be on the critical path to a working
-network.
-
-### There is no push notification
-
-The guest polls. This is the origin of the open question in PLAN.md §14 about
-poll interval versus a vsock nudge — and the reason a 30s default is a latency
-floor on every live reconfiguration.
-
-### V2 means the agent does a token dance
-
-V1 is deprecated and unauthenticated: any guest process can read it, including
-via SSRF through the tenant's own application. V2 requires a token obtained
-with `PUT /latest/api/token`, which the agent must fetch, cache, and refresh.
-The agent should **refuse to fall back to V1** even if the host configured it
-that way — that is a misconfiguration worth failing loudly on (design
-principle 5).
+There is no ACPI power button. On aarch64 there is no i8042 at all, so an
+aarch64 port needs a different trigger.
 
 ---
 
-## 7. Why the split between vminit and zpinit
+## 5. MMDS
 
-`tini` (`tini/src/tini.c`, 688 lines) does exactly two things: `waitpid`
-reaping and signal forwarding, plus `PR_SET_CHILD_SUBREAPER`. It does none of
-the machine bringup, so it does not reduce the work — and zpinit already
-supersedes it.
+An in-guest MMDS agent is deferred (PLAN.md §12). What it would have to deal
+with, if built:
 
-zpinit covers the other half well: centralized `wait4(-1, WNOHANG)` reaping
-with PID dispatch, `entrypoint.d`, a supervision state machine with backoff and
-readiness probes, replicas, and a control socket.
+- **Mutability is the whole point.** `PUT /mmds` replaces and `PATCH /mmds`
+  merges (RFC 7396), at any time, including while the VM runs. It is the only
+  channel that can reconfigure a live VM without a reboot.
+- **Bootstrapping.** MMDS is reached *over the network*, but the thing most
+  needed at boot is the network configuration. So boot-critical config arrives
+  on the config blob (PLAN.md §4.1), and an agent must never be on the
+  critical path to a working network.
+- **No push notification.** The guest polls, so any poll interval is a latency
+  floor on every live reconfiguration. Push over exec does the job better,
+  which is why the agent is deferred.
+- **V2 only.** V1 is unauthenticated: any guest process can read it, including
+  via SSRF through the tenant's own application. V2 needs a token from
+  `PUT /latest/api/token`, fetched, cached and refreshed. An agent must refuse
+  to fall back to V1 even if the host configured it.
 
-One useful accident: `internal/resources` takes the **minimum of cgroup limits
-and `/proc`**. A microVM has no cgroup limits — the VM's size *is* the limit —
-so detection falls through to `/proc` and reports the VM's actual vCPU count
-and RAM. `ZPINIT_CPU_COUNT` and `ZPINIT_MEMORY_BYTES` come out correct with no
-changes. Untested in that configuration; worth a test.
+---
 
-What zpinit lacks for VM use is written up in `ZPINIT_CHANGES.md`. The critical
-items are: reboot instead of exit as PID 1, do not `syscall.Exec` in VM mode,
-and handle Ctrl+Alt+Del.
+## 6. Why the split between vmsetup and zpinit
 
-### Why handoff is `execve`, not fork
+**Bringup** is what a container runtime does: runc prepares the machine once
+and is finished. **Being PID 1** is process management: reaping, signals,
+stopping, deciding what the workload's exit means. That is tini's job, and
+zpinit's. The split follows the job:
 
-zpinit does **not** set `PR_SET_CHILD_SUBREAPER` — verified by grep across
-`internal/` and `cmd/`. Its reaper package documents the assumption directly:
-"As PID 1 zpinit must reap every child, including orphans reparented to us from
-anywhere in the container after a double-fork."
+- **vmsetup** is bringup only and `execve`s zpinit. It manages no process at
+  any point. Both binaries ship in an initramfs the host attaches on every
+  boot, not in the image, which keeps a workload that owns its writable disk
+  from owning PID 1 on the next boot.
+- **zpinit** is PID 1 for the life of the VM, so exactly one process manager
+  runs per VM. The duties that only exist for the kernel's init (CAD_OFF, sync
+  and reboot instead of exit, the reset line, the vsock exec listener, rescue)
+  are an additive **machine mode**, specified in
+  [zpinit#10](https://github.com/0ploy/zpinit/issues/10). The duties that are
+  just good PID 1 behaviour (surviving every signal, a tini-style wrap mode
+  that stays resident above the command) are ordinary zpinit features that
+  containers benefit from too.
 
-If vminit stayed PID 1 and forked zpinit as PID 2, there would be **no reaping
-race** — `wait4(-1)` only reaps a process's own children, and the two
-parent/child sets are disjoint. But orphans from double-forks would reparent to
-vminit rather than zpinit. Nothing breaks functionally, since zpinit has no
-channel registered for untracked orphans anyway. The real cost is that code
-written against a documented "I am PID 1" invariant would run somewhere that
-invariant is false — a latent trap rather than a present bug.
+What zpinit already brings: centralized `wait4(-1, WNOHANG)` reaping with PID
+dispatch, `entrypoint.d`, a supervision state machine with backoff and
+readiness probes, replicas, and a control socket. One useful accident: its
+resource detection takes the **minimum of cgroup limits and `/proc`**. A
+microVM has no cgroup limits, since the VM's size *is* the limit, so detection
+falls through to `/proc` and reports the VM's actual vCPU count and RAM.
+Untested in that configuration (zpinit#10).
 
-The decisive argument is elsewhere: **systemd must be PID 1.** It checks
-`getpid() == 1` and refuses to run as a system manager otherwise. So `exec` is
-mandatory for distro images regardless. Given it is also correct for zpinit,
-one handoff mechanism covering both beats two mechanisms with two shutdown
-paths and two reaping models.
+Machine mode is **detected, not configured** (below), so no flag exists that a
+container user could set by mistake. The exec listener additionally needs
+`/run/zpinit/machine.json`, which vmsetup writes and zpinit ignores outside
+machine mode. Up to and including 6.18, vsock is not network-namespaced, and
+the af_vsock namespace modes added in later kernels default to `global`, so a
+container that opened a listener could be reached by the hypervisor of the
+host it runs on (checked against `net/vmw_vsock/af_vsock.c`).
 
-The `command` profile survives only for the bare-command case, where forking
-is strictly better than exec'ing. There is deliberately **no** exec-a-bare-
-command profile, because it loses on every axis:
+The kernel facts behind the container-mode guard, checked against v6.18
+`kernel/reboot.c` and `kernel/pid_namespace.c`: inside a child PID namespace,
+`reboot()` first needs `CAP_SYS_BOOT` in that namespace's user namespace (EPERM
+under Docker's default capabilities). If it gets past that,
+`reboot_pid_ns()` turns `RESTART` into SIGKILL of the namespace's init, with
+the container exiting as *killed by SIGHUP*, and rejects `CAD_OFF` with
+`EINVAL`. Calling either in a container is never harmless, which is why both
+sit behind the detection.
 
-- **PID 1 does not get default signal dispositions.** A workload exec'd as
-  PID 1 with no `SIGTERM` handler silently ignores SIGTERM — the classic
-  Docker footgun. Forked, it gets normal semantics with vminit forwarding.
-- Forked, vminit captures the exit status and can report it before rebooting.
-  Exec'd, nobody can — the VM just disappears.
-- Exec'd, nothing reaps orphans, and the workload must call `reboot()` itself
-  or panic the kernel on exit.
+### Telling "the kernel's init" from "a container's init" [VERIFIED]
 
-The only thing exec'ing saves is one process. The resulting rule — **exec only
-when the target requires PID 1, otherwise fork** — generates the entire profile
-table on its own.
+A process can tell, without a flag, whether it is PID 1 of the machine or PID 1
+of a container: `getpid() == 1` **and** `readlink /proc/self/ns/pid` is
+`pid:[4026531836]`. That number is `PROC_PID_INIT_INO` (`0xEFFFFFFC`), the
+fixed inode of the kernel's initial PID namespace; every other PID namespace
+gets a dynamically allocated inode. Checked on the host (`unshare --pid` gives
+`pid:[4026532817]`, PID 1, no `/proc/2`) and in the guest by the boot probe:
+both `/proc/self/ns/pid` and `/proc/1/ns/pid` read `pid:[4026531836]`.
+`/proc/1/ns/pid` is only readable with ptrace-read access to PID 1, so an
+unprivileged process reads its own link instead.
 
-### systemd images: generate config, do not apply it
+It detects "the kernel's init", not "a VM": bare metal booted with
+`init=zpinit` also matches, and wants the same behaviour. Kata and
+firecracker-containerd run the workload in a PID namespace inside the guest,
+so they correctly read as container. It guards against accidents, not
+deliberate fakes; a container can only fool its own `/proc`.
 
-systemd owns mounts, cgroups and network management. It has mount units for
-`/proc`, `/sys`, `/dev`, `/run` and `/sys/fs/cgroup` and expects to own them.
-systemd-networkd with a wildcard match will reconfigure a netlink-configured
-interface. On systemd-resolved systems `/etc/resolv.conf` is a symlink to a
-stub, so direct writes get overwritten.
+### Rejected, with the reason
 
-So for systemd targets vminit's job inverts: write configuration files the
-target will read, then exec — never configure imperatively.
+| Option | Why not |
+| --- | --- |
+| The bringup binary stays PID 1 and forks zpinit (or the workload) | Two process managers per VM: two reapers, two stop sequences, and two stop timeouts that have to nest. Bringup is not process management |
+| A fallback lifecycle in vmsetup for when zpinit cannot be exec'd | The same mistake, kept for a host-side bug. A broken bundle parks and reboots instead (PLAN.md §6.2) |
+| `execve` the bare workload as PID 1, no zpinit | PID 1 gets no default signal dispositions (a workload without a `SIGTERM` handler ignores the stop), nothing reaps orphans, nothing reports the exit status, and the workload's exit panics the kernel |
+| Handoff "profiles" for distro images (`cloud-init`, `systemd`, `openrc`) with generated network config | Distro images boot without the init bundle. MMDS is already EC2-shaped, so cloud-init's Ec2 datasource configures an Ubuntu cloud image with no guest init of ours |
+| A `--vm` flag on zpinit | A flag can be set by mistake in a container. Detection cannot |
+| Guest binaries baked into the image | The workload owns its writable disk and would own the next boot |
+| `pivot_root` for the switch | It refuses the initramfs, which is the rootfs mount itself; `MS_MOVE` + `chroot` is the standard `switch_root` (PLAN.md §5.2) |
 
-The part that is easy to miss is that **writing the file is not enough**. The
-consuming service is frequently installed but not enabled: Debian ships
-`systemd-networkd.service` disabled, and Alpine's `networking` init script is
-not necessarily in a runlevel. vminit cannot run `systemctl enable` or
-`rc-update add`, because neither init is running yet — it has to create the
-symlink directly.
+### Why Go is fine for vmsetup despite the runtime
 
-### Naming the generate profiles: init system, not config format
-
-Two things vary, and they are only partly correlated — the **init system**
-determines how a service gets enabled and what to exec; the **network config
-format** determines which file gets written.
-
-Naming by format breaks, because `ifupdown` spans both init systems. Verified
-by querying the package indexes:
-
-| | Debian 12 | Alpine 3.20 |
-| --- | --- | --- |
-| package | `ifupdown` 0.8.41 | `ifupdown-ng` 0.12.1 |
-| config file | `/etc/network/interfaces` | `/etc/network/interfaces` |
-| managed by | `networking.service` (**systemd** unit) | `/etc/init.d/networking` (**OpenRC**) |
-| enabled by | `multi-user.target.wants/` symlink | `/etc/runlevels/boot/` symlink |
-
-Same filename, different implementations, completely different enablement. A
-profile called `ifupdown` would say which file to write but nothing about how
-to make anything read it.
-
-Naming by distro breaks too: Ubuntu server uses netplan, Debian with systemd
-defaults to ifupdown, Debian cloud images use networkd — `debian` is ambiguous.
-
-The asymmetry that resolves it: **`openrc` fully determines everything**
-(Alpine → ifupdown-ng → runlevel symlink; one combination), while **`systemd`
-leaves the format open** (netplan / networkd / ifupdown). So the profile names
-the init system, with a single `network` sub-option read only under `systemd`.
-
-Note also that the two `ifupdown` implementations are only broadly compatible.
-Write the conservative common subset — plain `iface eth0 inet static` with
-`address` and `gateway` works on both.
-
-Better still for the common case: **MMDS is already EC2-shaped.** That is why
-Firecracker's own documentation examples use `ami-id`, `reservation-id` and
-`local-hostname` under `latest/meta-data`. cloud-init ships in every cloud
-image and its Ec2 datasource consumes that layout directly, so an Ubuntu cloud
-image needs no vminit at all — boot `/sbin/init`, populate MMDS in EC2 format.
-Established pattern; see the OnGres writeup and `firebuild` in Sources.
-
-Caveat to set expectations with: a systemd VM boots in seconds rather than
-milliseconds, wants a writable rootfs, and realistically needs 256 MB or more.
-Firecracker's fast-boot property does not survive a full distro.
-
-### Why Go is fine for vminit despite the runtime
-
-vminit `execve`s its handoff target, which **replaces the entire process
-image**. The Go runtime, its threads and its heap are gone. Steady-state
-footprint is exactly zero; the runtime only exists for the tens of milliseconds
-vminit is alive. Boot-time contribution is single-digit ms in any language —
-the real costs are kernel decompression, device probing, and console output.
+vmsetup `execve`s zpinit, which **replaces the entire process image**. The Go
+runtime, its threads and its heap are gone; the runtime only exists for the
+tens of milliseconds vmsetup is alive. The real boot costs are kernel
+decompression, device probing and console output, not the language.
 
 Requires `CGO_ENABLED=0`, which also gives the pure-Go `os/user` that parses
-`/etc/passwd` directly rather than going through NSS. That is the desired
-behavior for a container image.
+`/etc/passwd` directly rather than going through NSS: the desired behaviour
+for a container image.
 
 ---
 
-## 8. Prior art
+## 7. Prior art
 
-- **fly.io init** (`fly-io-init/`) — the closest reference. Two-drive layout
-  (`/dev/vda` init + config, `/dev/vdb` rootfs) with a hand-rolled switch_root
-  via `chdir` + `MS_MOVE` + `chroot` (`main.rs:214-232`). Config injected as
-  `/fly/run.json`. vsock server on port 10000 providing exec with PTY
-  (`src/api/exec.rs`, `src/pty/mod.rs`) — their `docker exec`. Reads
-  `/dev/kmsg` after a child dies to detect OOM kills (`main.rs:801-833`), a
-  trick worth copying since a VM has no cgroup OOM event to observe.
-- **Weave Ignite** (archived) — did exactly this task: pulled an OCI image,
-  created a container, exported the rootfs into an ext4 file, booted it as a
-  Firecracker VM in ~125ms. Closest existing prior art end to end.
-- **firecracker-containerd** — devmapper thin-provisioning snapshotter exposing
-  container images as block devices. Relevant if cross-VM image dedup becomes a
-  requirement.
+- **fly.io init** ([init-snapshot](https://github.com/superfly/init-snapshot))
+  is the closest reference: a hand-rolled switch_root via `chdir` + `MS_MOVE` +
+  `chroot`, netlink network setup, and a vsock exec server with PTY. It reads
+  `/dev/kmsg` after a child dies to detect OOM kills, a trick worth copying,
+  since a VM has no cgroup OOM event to observe.
+- **Weave Ignite** (archived) did this task end to end: pulled an OCI image,
+  exported the rootfs into an ext4 file, and booted it as a Firecracker VM in
+  ~125 ms.
+- **firecracker-containerd**: a devmapper snapshotter exposing container images
+  as block devices, and an in-guest agent that runs the workload in a PID
+  namespace.
 
 ---
 
@@ -401,9 +265,8 @@ behavior for a container image.
 - [Firecracker: MMDS user guide](https://github.com/firecracker-microvm/firecracker/blob/main/docs/mmds/mmds-user-guide.md)
 - [Firecracker: vsock](https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md)
 - [Firecracker: snapshot support](https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md)
-- [Firecracker: production host setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/prod-host-setup.md)
+- [Linux kernel: ramfs, rootfs and initramfs](https://docs.kernel.org/filesystems/ramfs-rootfs-initramfs.html)
 - [Linux kernel: nfsroot / `ip=` and `/proc/net/pnp`](https://docs.kernel.org/admin-guide/nfs/nfsroot.html)
 - [Weave Ignite](https://github.com/weaveworks/ignite)
 - [firecracker-containerd snapshotter](https://github.com/firecracker-microvm/firecracker-containerd/blob/main/docs/snapshotter.md)
 - [OnGres: running vanilla cloud images on Firecracker](https://ongres.com/blog/automation-to-run-vms-based-on-vanilla-cloud-images-on-firecracker/) — cloud-init + MMDS
-- [firebuild](https://gruchalski.com/posts/2021-03-23-introducing-firebuild/)

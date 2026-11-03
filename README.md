@@ -1,31 +1,31 @@
-# vminit
+# vmsetup
 
 > Boot an OCI/Docker image as a Firecracker microVM.
 
-`vminit` is a small static Go binary that runs as PID 1 inside a Firecracker
-microVM. It performs the machine bringup a container runtime would normally do
-for you — mounting filesystems, configuring the network from the inside,
-setting the hostname, writing `/etc/resolv.conf` — and then hands off to
-whatever supervisor the image is meant to run under.
+`vmsetup` is a small static Go binary that runs first inside a Firecracker
+microVM, as `/init` of a host-supplied initramfs. It mounts the VM's disk and
+switches root into it, then performs the machine bringup a container runtime
+would normally do for you: mounting filesystems, configuring the network from
+the inside, setting the hostname, writing `/etc/resolv.conf`, resolving the
+image's user. Then it **`execve`s [zpinit](https://github.com/0ploy/zpinit)**,
+which is PID 1 for the rest of the VM's life.
 
-**Status: early implementation.** `vminit boot` performs full bringup and hands
-off to [zpinit](https://github.com/0ploy/zpinit), verified on real hardware:
-`test/run.sh` boots a `scratch`-like rootfs under Firecracker and checks the
-resulting machine from the inside. The other four profiles, `vminit agent` and
-`vmpack` are not built yet, and refuse loudly rather than half-working. See
-[PLAN.md](PLAN.md) for the full design and [docs/RESEARCH.md](docs/RESEARCH.md)
-for the findings it rests on.
+vmsetup manages no process at any point. zpinit's *machine mode*
+([zpinit#10](https://github.com/0ploy/zpinit/issues/10)) owns everything after
+the `execve`: reaping, the graceful stop, ending the VM, `exec` over vsock and
+rescue. Its host-side counterpart is [fctl](https://github.com/0ploy/fctl), the
+VM manager that owns the Firecracker process, the kernel command line, the
+image and the config.
 
 ```
-go build ./cmd/vminit     # CGO_ENABLED=0; static, no libc
-go test ./...             # unit tests, no KVM needed
-sudo ./test/run.sh        # boot matrix; needs KVM, firecracker, mkfs.ext4
+CGO_ENABLED=0 go build ./cmd/vmsetup     # static, no libc
+go run ./cmd/mkbundle -vmsetup vmsetup -zpinit zpinit -zpctl zpctl -o init.cpio
+go test ./...                            # unit tests, no KVM needed
+sudo KERNEL=/path/to/vmlinux ZPINIT=/path/to/zpinit test/run.sh   # boot matrix, needs KVM
 ```
 
-`vminit` is the **guest** half. Its host-side counterpart is
-[fctl](../fctl) — the VM manager that owns the Firecracker process, the kernel
-command line, guest kernel builds, networking and snapshots. If a question is
-about what happens before `init=` is exec'd, it belongs there.
+See [PLAN.md](PLAN.md) for the design and spec, and
+[docs/RESEARCH.md](docs/RESEARCH.md) for the findings it rests on.
 
 ## Why this exists
 
@@ -34,85 +34,72 @@ mounts `/proc`, `/sys` and `/dev`, creates a veth pair and configures it *from
 the host*, writes `/etc/hosts` and `/etc/resolv.conf`, resolves the image's
 `USER` to a uid, and applies `Entrypoint`, `Cmd`, `Env` and `WorkingDir`.
 
-A microVM gets none of it. The kernel boots, mounts a root filesystem, and
-executes one binary as PID 1. Everything else is that binary's problem —
-including the network, because there is no shared namespace for the host to
-reach into. That binary is `vminit`.
-
-## Security first
-
-**Security and isolation come first. Performance is taken only where it is
-harmless to isolation.** The workload is untrusted and the VM boundary is the
-only boundary; vminit sits on the guest side of it. Host-side reasoning and the
-rejected optimisations live in
-[fctl/docs/threat-model.md](../fctl/docs/threat-model.md).
+A microVM gets none of it. The kernel boots and executes one binary as PID 1.
+Everything else is that binary's problem, including the network, because
+there is no shared namespace for the host to reach into. That binary is
+`vmsetup`.
 
 ## Design in one line
 
 ```
-kernel → vminit boot → [bringup] → execve(handoff target)
+kernel → initramfs /init = vmsetup (switch root, bringup, ~25 ms) → execve → zpinit (PID 1 for the life of the VM) → workload
 ```
 
-`vminit` does bringup and then replaces itself. It is deliberately **not** a
-supervisor.
+This is Docker's runc/tini split, applied to a VM. vmsetup is the runc half:
+it prepares the machine once and is gone. zpinit is the tini half: as the
+kernel's own init it reaps, turns Ctrl+Alt+Del into a graceful stop, serves
+`exec` over vsock, and ends the VM with sync and reboot, writing one line to
+the serial port that tells the host why. Exactly one process manager runs per
+VM.
 
-## Not tied to any one supervisor
+zpinit detects that it is the kernel's init (PID 1 in the initial PID
+namespace) rather than a container's, so machine mode needs no flag and can
+never switch on inside a container.
 
-One flat knob decides both what vminit does to the machine and whether it
-survives the handoff — the two are not independent, so exposing them
-separately would only invite combinations that cannot work:
+The workload owns its disk but not PID 1: vmsetup and zpinit come from the
+host on every boot, so nothing written to the disk can replace them.
 
-```toml
-[boot]
-profile = "zpinit"   # zpinit | command | cloud-init | systemd | openrc
+**Security and isolation come first.** The workload is untrusted and the VM
+boundary is the only boundary; vmsetup sits on the guest side of it and
+enforces nothing itself.
+
+## How the workload runs
+
+zpinit is always the handoff target. The config says which of its modes:
+
+```jsonc
+"handoff": {
+  "command":      ["/docker-entrypoint.sh", "nginx", "-g", "daemon off;"],  // absent → supervise mode
+  "user":         "nginx",
+  "working_dir":  "/",
+  "stop_signal":  "SIGQUIT",
+  "stop_timeout": "10s"
+}
 ```
 
-Read it as an answer to one question: **who is going to configure this
-machine's network?**
+- **Plain Docker images** run in zpinit's wrap mode. zpinit forks the Docker
+  command as its one child and stays PID 1, which is `docker run --init`.
+- **zpinit-native images** run in supervise mode with their own
+  `/etc/zpinit` services.
 
-| `profile` | configured by | vminit's job | handoff |
-| --- | --- | --- | --- |
-| `zpinit` | vminit | apply | `execve` [zpinit](https://github.com/0ploy/zpinit) |
-| `command` | vminit | apply | fork + supervise |
-| `cloud-init` | cloud-init | pin the datasource | `execve` init |
-| `systemd` | systemd's network stack | write config + enable it | `execve` init |
-| `openrc` | OpenRC's `networking` service | write config + enable it | `execve` init |
-
-The handoff column follows from one rule: **`execve` only when the target
-requires PID 1; otherwise fork.** zpinit requires it, systemd requires it, a
-bare command does not.
-
-**Apply** profiles are for OCI images: vminit mounts, configures the network
-via netlink, and hands off. **Generate** profiles are for full-distro images
-you build yourself — systemd and OpenRC own mounts, cgroups and networking, so
-vminit writes config files they will consume and touches nothing else.
-
-Generate profiles are named after the **init system**, because that is what
-determines how a service gets enabled. The config *format* is a separate
-question that only `systemd` leaves open (`network = netplan | systemd-networkd
-| ifupdown`) — `openrc` fully determines it. If you are building the image
-anyway, installing cloud-init sidesteps all of it; see
-[PLAN.md §4.5](PLAN.md).
-
-`vminit` and `zpinit` are designed to work well together, but neither requires
-the other.
+fctl composes the config per launch, fully resolved (there is nothing to merge
+in the guest), and unknown fields are rejected.
 
 ## Repository layout
 
 | Path | Role |
 | --- | --- |
-| `cmd/vminit` | Guest-side binary: `boot` and `agent` subcommands |
-| `cmd/vmpack` | Host-side packer: OCI image → bootable ext4 rootfs *(not built yet)* |
-| `internal/config` | Shared config schema — the reason both binaries live here |
-| `internal/mounts` | The filesystem hierarchy |
+| `cmd/vmsetup` | The guest binary. As PID 1 it boots; by hand, `vmsetup check FILE` validates a config |
+| `cmd/mkbundle` | Builds the init bundle: a reproducible cpio of vmsetup as `/init`, zpinit and zpctl |
+| `internal/config` | Guest config schema and the blob format |
+| `internal/mounts` | devtmpfs in the initramfs, the switch root, the mount table |
+| `internal/machine` | What vmsetup hands zpinit: `machine.json` and the env file |
+| `internal/bundle` | The cpio writer behind `mkbundle` |
 | `internal/netconf` | Network configuration over netlink |
 | `internal/identity` | Hostname, `/etc/hosts`, `/etc/resolv.conf` |
 | `internal/userenv` | User resolution and env composition |
-| `internal/vmlog` | The console log, buffered until `/dev/ttyS0` exists |
-| `test/` | Boot matrix: fixture rootfs builder, Firecracker harness, in-guest probe |
-
-`vmpack` writes the config that `vminit` reads. Keeping them in one repo is
-what stops the schema from drifting.
+| `internal/vmlog` | The console log, and the park line the host matches |
+| `test/` | Boot matrix: fixture builder, config-blob encoder, Firecracker harness, in-guest probe |
 
 ## License
 
