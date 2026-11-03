@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"encoding/binary"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -210,5 +211,45 @@ func TestDeviceFromCmdline(t *testing.T) {
 		if err != nil || got != tt.want {
 			t.Errorf("%q: got %q, %v; want %q", tt.cmdline, got, err, tt.want)
 		}
+	}
+}
+
+// TestBlobWriterReader is the contract between fctl and vmsetup: what the
+// writer's Blob produces, the guest's Decode and Parse accept unchanged.
+func TestBlobWriterReader(t *testing.T) {
+	want, err := Parse([]byte(validDoc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fixture's "search": [] is written back as absent; both mean none.
+	want.Network.Search = nil
+	b, err := want.Blob()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) != DeviceSize {
+		t.Fatalf("blob is %d bytes, want %d", len(b), DeviceSize)
+	}
+	doc, err := Decode(bytes.NewReader(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Parse(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("round trip changed the config:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestBlobValidates(t *testing.T) {
+	c, err := Parse([]byte(validDoc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Root.Options = "ro"
+	if _, err := c.Blob(); err == nil || !strings.Contains(err.Error(), "must not contain ro") {
+		t.Fatalf("Blob wrote an invalid config: %v", err)
 	}
 }

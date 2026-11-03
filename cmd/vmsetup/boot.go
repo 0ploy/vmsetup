@@ -10,7 +10,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
-	"github.com/0ploy/vmsetup/internal/config"
+	"github.com/0ploy/vmsetup/config"
 	"github.com/0ploy/vmsetup/internal/devwait"
 	"github.com/0ploy/vmsetup/internal/identity"
 	"github.com/0ploy/vmsetup/internal/machine"

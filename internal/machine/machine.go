@@ -15,7 +15,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/0ploy/vmsetup/internal/config"
+	"github.com/0ploy/vmsetup/config"
 )
 
 const (

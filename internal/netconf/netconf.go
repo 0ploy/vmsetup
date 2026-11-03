@@ -18,7 +18,7 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
-	"github.com/0ploy/vmsetup/internal/config"
+	"github.com/0ploy/vmsetup/config"
 	"github.com/0ploy/vmsetup/internal/devwait"
 )
 

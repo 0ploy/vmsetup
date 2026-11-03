@@ -14,7 +14,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/0ploy/vmsetup/internal/config"
+	"github.com/0ploy/vmsetup/config"
 )
 
 func main() {
@@ -29,10 +29,12 @@ func main() {
 	if err != nil {
 		fail(err)
 	}
-	if _, err := config.Parse(doc); err != nil {
+	cfg, err := config.Parse(doc)
+	if err != nil {
 		fail(fmt.Errorf("%s does not validate: %w", flag.Arg(0), err))
 	}
-	blob, err := config.Encode(doc)
+	// The writer's path, the one fctl uses: re-encode from the Config.
+	blob, err := cfg.Blob()
 	if err != nil {
 		fail(err)
 	}

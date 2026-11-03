@@ -106,6 +106,15 @@ and says it did not appear. A device that is already there costs nothing.
 Unknown fields are an error. The version is bumped for any change vmsetup
 cannot read compatibly.
 
+**The schema is code, shared.** The Go package
+[`github.com/0ploy/vmsetup/config`](config) holds the types, the validation
+below and the blob encoder. fctl builds a `config.Config` and writes
+`cfg.Blob()`, so it runs the guest's validation at create time and a schema
+change is a compile error in fctl, not a parked VM. A config built against one
+version of the package belongs with a bundle whose vmsetup reads that schema;
+pairing them is part of the bundle's provenance
+([#6](https://github.com/0ploy/vmsetup/issues/6)).
+
 ### 4.2 Schema
 
 ```jsonc

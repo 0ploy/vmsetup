@@ -92,7 +92,7 @@ in the guest), and unknown fields are rejected.
 | --- | --- |
 | `cmd/vmsetup` | The guest binary. As PID 1 it boots; by hand, `vmsetup check FILE` validates a config |
 | `cmd/mkbundle` | Builds the init bundle: a reproducible cpio of vmsetup as `/init`, zpinit and zpctl |
-| `internal/config` | Guest config schema and the blob format |
+| `config` | Guest config schema and the blob format. Public: fctl imports it to write the config, so writer and reader cannot drift |
 | `internal/mounts` | devtmpfs in the initramfs, the switch root, the mount table |
 | `internal/machine` | What vmsetup hands zpinit: `machine.json` and the env file |
 | `internal/bundle` | The cpio writer behind `mkbundle` |

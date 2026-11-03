@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/0ploy/vmsetup/internal/config"
+	"github.com/0ploy/vmsetup/config"
 )
 
 func cfg(command []string, exec *config.Exec) *config.Config {

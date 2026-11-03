@@ -1,10 +1,23 @@
-// Package config defines the guest config: the one JSON document fctl
-// composes for each launch and vmsetup reads at boot. See SPEC.md §4.
+// Package config is the guest config: the one JSON document fctl composes for
+// each launch and vmsetup reads at boot, and the blob it travels in. The spec
+// is https://github.com/0ploy/vmsetup/blob/main/SPEC.md §4.
 //
-// vmsetup owns the schema and fctl writes it. Drift between the writer and the
-// reader is the likeliest bug in the design, so the document carries only
-// resolved values (principle 7: no merging in the guest) and decoding is
-// strict -- a field vmsetup does not know is an error, never silently ignored.
+// vmsetup owns the schema and fctl writes it. Drift between the writer and
+// the reader is the likeliest bug in the design, so both use this package:
+// the writer builds a Config, and Blob validates it with the same rules the
+// guest applies and encodes it. The document carries only resolved values
+// (no merging in the guest) and decoding is strict: a field vmsetup does not
+// know is an error, never silently ignored.
+//
+// The writer's side:
+//
+//	cfg := &config.Config{Handoff: ..., Root: ..., Logging: ...}
+//	blob, err := cfg.Blob()          // validated, encoded, DeviceSize bytes
+//	os.WriteFile("config.blob", blob, 0o600)
+//
+// A Config built against one version of this package must only be paired
+// with an init bundle whose vmsetup reads the same schema: unknown fields
+// park the guest.
 package config
 
 import (
@@ -191,6 +204,20 @@ func Parse(doc []byte) (*Config, error) {
 		return nil, err
 	}
 	return &c, nil
+}
+
+// Blob validates c and encodes it as the config device's contents: the
+// header, the JSON document, and NUL padding to DeviceSize. It is what the
+// host writes; the guest's Parse accepts exactly what it produces.
+func (c *Config) Blob() ([]byte, error) {
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
+	doc, err := json.Marshal(c)
+	if err != nil {
+		return nil, fmt.Errorf("encode config: %w", err)
+	}
+	return Encode(doc)
 }
 
 // Validate rejects a document that cannot produce a correct machine, naming

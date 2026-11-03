@@ -14,7 +14,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/0ploy/vmsetup/internal/config"
+	"github.com/0ploy/vmsetup/config"
 )
 
 var version = "dev"

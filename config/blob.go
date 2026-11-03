@@ -98,8 +98,8 @@ func Decode(r io.Reader) ([]byte, error) {
 	return doc, nil
 }
 
-// Encode wraps a document in a blob header and pads it to DeviceSize. This
-// is the writer's half; fctl's encoder must produce the same bytes.
+// Encode wraps a document in a blob header and pads it to DeviceSize. Writers
+// building a Config should use Config.Blob, which validates first.
 func Encode(doc []byte) ([]byte, error) {
 	if len(doc) == 0 {
 		return nil, errors.New("empty document")
