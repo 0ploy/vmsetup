@@ -11,6 +11,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/0ploy/vmsetup/internal/config"
+	"github.com/0ploy/vmsetup/internal/devwait"
 	"github.com/0ploy/vmsetup/internal/identity"
 	"github.com/0ploy/vmsetup/internal/machine"
 	"github.com/0ploy/vmsetup/internal/mounts"
@@ -129,6 +130,9 @@ func loadConfig() (*config.Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := devwait.Device(dev, devwait.Timeout); err != nil {
+		return nil, fmt.Errorf("config device: %w", err)
+	}
 	doc, err := config.ReadBlob(dev)
 	if err != nil {
 		return nil, err
@@ -206,6 +210,12 @@ func (s *setup) handoff() {
 		s.park(stepHandoff, fmt.Errorf("chdir %s: %w", dir, err))
 	}
 	s.log.Infof("bringup complete in %.3fms; exec %s", float64(s.log.Elapsed().Microseconds())/1000, path)
+	if s.cfg.BootTimer {
+		if err := signalBootTimer(); err != nil {
+			// Only a measurement is lost; the VM is fine.
+			s.log.Warnf("boot timer: %v", err)
+		}
+	}
 	err := unix.Exec(path, argv, s.env.Slice())
 	s.park(stepHandoff, fmt.Errorf("execve %s: %w", path, err))
 }

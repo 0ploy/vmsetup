@@ -83,7 +83,9 @@ echo "==> booting $SCENARIO (serial -> $SERIAL)"
 rm -f "$SOCK"
 : > "$SERIAL"
 START=$(now)
-firecracker --api-sock "$SOCK" --config-file "$CONFIG" > "$SERIAL" 2>&1 &
+FC_FLAGS=()
+[ "${BOOT_TIMER:-0}" = 1 ] && FC_FLAGS+=(--boot-timer)
+firecracker --api-sock "$SOCK" --config-file "$CONFIG" "${FC_FLAGS[@]}" > "$SERIAL" 2>&1 &
 FC_PID=$!
 
 reasons=()
@@ -184,6 +186,14 @@ fi
 if tr -d '\r' < "$SERIAL" | grep -q '^vmsetup: reset '; then
   reasons+=("vmsetup wrote a reset line; ending the VM is zpinit's")
 fi
+# The boot timer is vmsetup's, written just before the execve. Firecracker
+# logs it, measured on the host from InstanceStart.
+BOOT_TIME=$(grep -o 'Guest-boot-time = .*' "$SERIAL" | head -1)
+if [ "${BOOT_TIMER:-0}" = 1 ]; then
+  [ -n "$BOOT_TIME" ] || reasons+=("no Guest-boot-time line; vmsetup did not signal the boot timer")
+elif grep -q 'Invalid MMIO .* @ 0xc0000000' "$SERIAL"; then
+  reasons+=("an MMIO write with the boot timer off; vmsetup must write only when the config asks")
+fi
 if [ -n "$STOP_AT" ] && [ "$MIN_STOP_SECS" != 0 ]; then
   took=$(echo "$END - $STOP_AT" | bc)
   if [ "$(echo "$took < $MIN_STOP_SECS" | bc)" = 1 ]; then
@@ -194,6 +204,7 @@ fi
 
 printf 'host-measured to trigger: %.2fs, to VM exit: %.2fs\n' \
   "$(echo "$READY - $START" | bc)" "$(echo "$END - $START" | bc)"
+[ -n "$BOOT_TIME" ] && echo "firecracker boot timer (vmsetup's execve): ${BOOT_TIME#Guest-boot-time = }"
 if [ "$MACHINE_MODE" = 1 ]; then
   echo "reset line: ${RESET:-<none>}"
 else

@@ -97,6 +97,12 @@ does not decode. It never searches elsewhere: a drive-ordering bug must read
 as "not the config device", not as a parse of somebody's data volume. Every
 other device is named in the document.
 
+**Every device is waited for, bounded.** With an initramfs nothing waits for
+device probing before `/init` runs, so vmsetup polls for the config device,
+`root.device`, each `mounts[].device` and each interface for up to 2 s. One
+that never appears parks with its step (`config`, `root`, `mounts`, `network`)
+and says it did not appear. A device that is already there costs nothing.
+
 Unknown fields are an error. The version is bumped for any change vmsetup
 cannot read compatibly.
 
@@ -128,7 +134,8 @@ cannot read compatibly.
         "mac":     "06:00:AC:10:00:02",   // optional; find the link by MAC when set
         "address": "10.77.0.5/32",
         "gateway": "169.254.0.1",
-        "mmds":    false                  // add a host route to 169.254.169.254
+        "mmds":    false,                 // add a host route to 169.254.169.254
+        "mtu":     1480                   // optional; absent leaves the driver's MTU
       }
     ],
     "nameservers":  ["1.1.1.1"],
@@ -147,7 +154,11 @@ cannot read compatibly.
   // Optional. Absent → zpinit opens no exec listener. Passed through (§6).
   "exec": { "port": 1024, "user": "nginx", "working_dir": "/" },
 
-  "logging": { "target": "serial" }   // "serial" | "none"
+  "logging": { "target": "serial" },  // "serial" | "none"
+
+  // Optional. True → write Firecracker's boot-timer device just before the
+  // execve (§6). Set it exactly when the VMM runs with --boot-timer.
+  "boot_timer": true
 }
 ```
 
@@ -165,7 +176,7 @@ anything acts on the document:
 - `stop_signal` is a known signal name; `stop_timeout` is a positive Go
   duration.
 - Every `env` entry is `KEY=value` with a non-empty key; interface names are
-  unique.
+  unique; an interface `mtu`, when set, is within 68–65535.
 
 A violation is a host-side bug and parks with the field named.
 `vmsetup check FILE` runs the same validation on a blob or bare JSON.
@@ -208,7 +219,8 @@ Plus `/dev/fd`, `/dev/stdin`, `/dev/stdout` and `/dev/stderr` as symlinks into
 `/proc/self/fd`.
 
 **Network.** `lo` is up. Each interface is found by `mac` if set, else by
-name, then brought up with its address and a default route via `gateway`. The
+name, given `mtu` if set, then brought up with its address and a default
+route via `gateway`. The
 route carries `onlink` exactly when the address does not contain the gateway,
 as with a routed `/32`. That is computed, not configured: always setting it
 would turn a mistyped gateway on a normal subnet into a silent blackhole
@@ -233,6 +245,11 @@ root in supervise mode) and `TERM=linux`, each only if unset.
 
 vmsetup's last act is `execve`. zpinit inherits PID 1, stdio and the working
 directory; nothing of vmsetup stays resident.
+
+With `boot_timer`, vmsetup first writes byte `123` to physical `0xc0000000`
+through `/dev/mem`, and Firecracker logs `Guest-boot-time = N us`: the time
+from `InstanceStart` to this point, measured on the host. A failed write is a
+warning, not a park; only the measurement is lost.
 
 | Channel | Carries |
 | --- | --- |
@@ -353,6 +370,7 @@ CONFIG_BLK_DEV_INITRD=y                         # the init bundle
 CONFIG_VIRTIO_BLK=y  CONFIG_VIRTIO_NET=y  CONFIG_VIRTIO_MMIO=y
 CONFIG_EXT4_FS=y
 CONFIG_DEVTMPFS=y                               # vmsetup mounts it itself
+CONFIG_DEVMEM=y                                 # the boot-timer write; STRICT_DEVMEM allows it
 CONFIG_SERIAL_8250=y  CONFIG_SERIAL_8250_RUNTIME_UARTS=1   # log, park and reset lines
 CONFIG_SERIO_I8042=y  CONFIG_KEYBOARD_ATKBD=y   # Ctrl+Alt+Del must reach zpinit
 CONFIG_VSOCKETS=y  CONFIG_VIRTIO_VSOCKETS=y     # exec and rescue

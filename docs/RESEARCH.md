@@ -288,6 +288,14 @@ v1.17.0, guest kernel 6.18.39.
 - **A Ctrl+Alt+Del sent ~0.65 s after the VMM starts is lost** [VERIFIED]. The
   initramfs boot reaches `/init` before the i8042/atkbd probe (~510 ms on this
   kernel) finishes, and the event goes nowhere. A resend 1 s later works.
+- **The boot timer works from vmsetup** [VERIFIED]. A one-byte write of
+  `123` to `0xc0000000` through `/dev/mem`, on a kernel with
+  `CONFIG_STRICT_DEVMEM=y`, makes Firecracker log
+  `Guest-boot-time = 131235 us` (131–135 ms across runs): `InstanceStart` to
+  vmsetup's `execve`. Without `--boot-timer` nothing backs that address, and
+  the write would only produce a VMM warning, which is why the config gates it.
+  Every boot also logs two `Invalid MMIO read @ 0xfed803c0` lines; that is
+  the kernel probing, not vmsetup.
 - **Timing** [VERIFIED]: measured from the host, the probe reports ~0.43 s
   after the Firecracker process starts. vmsetup itself, `/init` to `execve`, takes
   21–35 ms, of which the switch root is ~8 ms.

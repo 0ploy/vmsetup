@@ -19,6 +19,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/0ploy/vmsetup/internal/config"
+	"github.com/0ploy/vmsetup/internal/devwait"
 )
 
 // Logger is the subset of vmlog.Logger this package needs.
@@ -54,11 +55,25 @@ func upLoopback() error {
 }
 
 func applyInterface(log Logger, iface config.Interface) error {
-	link, err := findLink(iface)
+	// Like the block devices, the NIC may still be probing when /init runs.
+	var link netlink.Link
+	err := devwait.Poll(devwait.Timeout, func() (err error) {
+		link, err = findLink(iface)
+		return err
+	})
 	if err != nil {
 		return err
 	}
 	name := link.Attrs().Name
+
+	// Before the link goes up. Firecracker can also advertise the MTU to the
+	// driver (VIRTIO_NET_F_MTU), but the config is what vmsetup trusts.
+	if iface.MTU != 0 && link.Attrs().MTU != iface.MTU {
+		if err := netlink.LinkSetMTU(link, iface.MTU); err != nil {
+			return fmt.Errorf("set mtu %d on %s: %w", iface.MTU, name, err)
+		}
+		log.Infof("mtu %d on %s", iface.MTU, name)
+	}
 
 	if err := netlink.LinkSetUp(link); err != nil {
 		return fmt.Errorf("bring %s up: %w", name, err)

@@ -90,8 +90,12 @@ func printPlan(cfg *config.Config) {
 	fmt.Printf("root         %s (%s) %s\n", cfg.Root.Device, cfg.Root.FSType, cfg.Root.Options)
 	fmt.Printf("env          %d variables\n", len(cfg.Env))
 	for _, iface := range cfg.Network.Interfaces {
-		fmt.Printf("interface    %s %s gw=%s mac=%s mmds=%t\n",
-			iface.Name, iface.Address, iface.Gateway, iface.MAC, iface.MMDS)
+		mtu := "driver"
+		if iface.MTU != 0 {
+			mtu = fmt.Sprint(iface.MTU)
+		}
+		fmt.Printf("interface    %s %s gw=%s mac=%s mtu=%s mmds=%t\n",
+			iface.Name, iface.Address, iface.Gateway, iface.MAC, mtu, iface.MMDS)
 	}
 	for _, ns := range cfg.Network.Nameservers {
 		fmt.Printf("nameserver   %s\n", ns)
@@ -105,4 +109,5 @@ func printPlan(cfg *config.Config) {
 		fmt.Printf("exec         off\n")
 	}
 	fmt.Printf("logging      %s\n", cfg.Logging.Target)
+	fmt.Printf("boot timer   %t\n", cfg.BootTimer)
 }

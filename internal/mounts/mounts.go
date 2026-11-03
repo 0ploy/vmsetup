@@ -20,6 +20,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/0ploy/vmsetup/internal/config"
+	"github.com/0ploy/vmsetup/internal/devwait"
 )
 
 // common is the flag set every pseudo-filesystem gets: no devices, no
@@ -122,6 +123,9 @@ func SwitchRoot(log Logger, root config.Root, binDir string, bins []Binary) erro
 		return err
 	}
 
+	if err := devwait.Device(root.Device, devwait.Timeout); err != nil {
+		return fmt.Errorf("root: %w", err)
+	}
 	flags, data := parseOptions(root.Options)
 	if err := os.MkdirAll(NewRoot, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", NewRoot, err)
@@ -360,6 +364,9 @@ func isMountpoint(p string) bool {
 // Extra applies the config's data volumes, after the standard table.
 func Extra(log Logger, ms []config.Mount) error {
 	for _, m := range ms {
+		if err := devwait.Device(m.Device, devwait.Timeout); err != nil {
+			return fmt.Errorf("mount on %s: %w", m.Path, err)
+		}
 		flags, data := parseOptions(m.Options)
 		if err := os.MkdirAll(m.Path, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
 			return fmt.Errorf("mkdir %s: %w", m.Path, err)

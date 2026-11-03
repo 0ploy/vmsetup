@@ -63,6 +63,7 @@ func main() {
 		hostname   = flag.String("hostname", "", "hostname vmsetup was told to set")
 		address    = flag.String("address", "", "interface address in CIDR form")
 		iface      = flag.String("interface", "eth0", "interface name")
+		mtu        = flag.Int("mtu", 0, "expected MTU of the interface; 0 skips the check")
 		gateway    = flag.String("gateway", "", "default gateway")
 		nameserver = flag.String("nameserver", "", "expected nameserver in /etc/resolv.conf")
 		uid        = flag.Int("uid", 0, "uid the service is expected to run as")
@@ -165,6 +166,15 @@ func main() {
 
 	if *address != "" {
 		c.check("address "+*iface, hasAddress(*iface, *address), addrList(*iface))
+	}
+	if *mtu != 0 {
+		got := "no such interface"
+		ok := false
+		if link, err := net.InterfaceByName(*iface); err == nil {
+			got = fmt.Sprint(link.MTU)
+			ok = link.MTU == *mtu
+		}
+		c.check(fmt.Sprintf("mtu %s %d", *iface, *mtu), ok, got)
 	}
 	if *gateway != "" {
 		c.check("default route", hasDefaultRoute(*gateway), *gateway)

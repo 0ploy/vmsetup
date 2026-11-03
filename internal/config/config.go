@@ -45,6 +45,13 @@ type Config struct {
 	Exec *Exec `json:"exec,omitempty"`
 
 	Logging Logging `json:"logging"`
+
+	// BootTimer, when true, makes vmsetup signal Firecracker's boot-timer
+	// device just before it execs zpinit, so the host logs the boot time
+	// without trusting a guest clock. fctl sets it exactly when it enabled
+	// the device: without it the write lands on nothing and Firecracker logs
+	// an invalid MMIO access.
+	BootTimer bool `json:"boot_timer,omitempty"`
 }
 
 // Handoff is fully resolved by fctl: Docker's --entrypoint / --user / -w /
@@ -89,6 +96,9 @@ type Interface struct {
 	Gateway string `json:"gateway,omitempty"`
 	// MMDS adds a host route to the MMDS address over this link.
 	MMDS bool `json:"mmds,omitempty"`
+	// MTU, when set, is applied before the link goes up. Absent leaves the
+	// driver's MTU, which is what Firecracker advertised or 1500.
+	MTU int `json:"mtu,omitempty"`
 }
 
 type HostEntry struct {
@@ -132,6 +142,13 @@ const (
 type Logging struct {
 	Target LogTarget `json:"target"`
 }
+
+// The MTU range vmsetup accepts: IPv4's minimum, and the largest a virtio-net
+// link takes.
+const (
+	MinMTU = 68
+	MaxMTU = 65535
+)
 
 // MMDSAddress is where Firecracker's MMDS answers. It is fixed by
 // Firecracker's default, so it is not a config field: one more value fctl
@@ -238,6 +255,9 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("network.interfaces[%d]: duplicate name %q", i, iface.Name)
 		}
 		seen[iface.Name] = struct{}{}
+		if iface.MTU != 0 && (iface.MTU < MinMTU || iface.MTU > MaxMTU) {
+			return fmt.Errorf("network.interfaces[%d].mtu %d is outside %d..%d", i, iface.MTU, MinMTU, MaxMTU)
+		}
 	}
 
 	for i, m := range c.Mounts {

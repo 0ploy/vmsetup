@@ -19,7 +19,7 @@ const validDoc = `{
   },
   "env": ["PATH=/usr/bin:/bin", "A=1"],
   "network": {
-    "interfaces": [{"name": "eth0", "mac": "06:00:AC:10:00:02", "address": "10.77.0.5/32", "gateway": "169.254.0.1", "mmds": false}],
+    "interfaces": [{"name": "eth0", "mac": "06:00:AC:10:00:02", "address": "10.77.0.5/32", "gateway": "169.254.0.1", "mmds": false, "mtu": 1480}],
     "nameservers": ["1.1.1.1"],
     "search": [],
     "extra_hosts": [{"ip": "10.0.0.5", "host": "db.internal"}]
@@ -27,7 +27,8 @@ const validDoc = `{
   "root": {"device": "/dev/vdb", "fstype": "ext4", "options": "discard"},
   "mounts": [{"device": "/dev/vdc", "path": "/data", "fstype": "ext4", "options": "relatime"}],
   "exec": {"port": 1024, "user": "nginx", "working_dir": "/"},
-  "logging": {"target": "serial"}
+  "logging": {"target": "serial"},
+  "boot_timer": true
 }`
 
 // superviseHandoff is the handoff of a zpinit-native image: no command, and
@@ -56,7 +57,8 @@ func TestParseValid(t *testing.T) {
 	if !c.Handoff.Wrap() || c.Handoff.Command[0] != "/docker-entrypoint.sh" {
 		t.Errorf("handoff = %+v", c.Handoff)
 	}
-	if c.Root.Device != "/dev/vdb" || c.Root.Options != "discard" || c.Exec.Port != 1024 {
+	if c.Root.Device != "/dev/vdb" || c.Root.Options != "discard" || c.Exec.Port != 1024 ||
+		c.Network.Interfaces[0].MTU != 1480 || !c.BootTimer {
 		t.Errorf("decoded %+v", c)
 	}
 }
@@ -89,8 +91,8 @@ func TestParseRejects(t *testing.T) {
 		{"old overlay_root", `"hostname"`, `"overlay_root": {}, "hostname"`, `unknown field "overlay_root"`},
 		{"old handoff.argv", `"user": "nginx",`, `"user": "nginx", "argv": ["/x"],`, `unknown field "argv"`},
 		{"old handoff.env_file", `"user": "nginx",`, `"user": "nginx", "env_file": "/run/zpinit/env",`, `unknown field "env_file"`},
-		{"trailing data", `"serial"}
-}`, `"serial"}
+		{"trailing data", `true
+}`, `true
 } {}`, "trailing data"},
 		{"empty command", `["/docker-entrypoint.sh", "nginx", "-g", "daemon off;"]`, `[]`, "handoff.command must be non-empty"},
 		{"empty command[0]", `["/docker-entrypoint.sh",`, `["",`, "handoff.command[0]"},
@@ -114,6 +116,10 @@ func TestParseRejects(t *testing.T) {
 		{"exec without port", `"port": 1024`, `"port": 0`, "exec.port"},
 		{"bad log target", `"serial"`, `"syslog"`, "logging.target"},
 		{"missing log target", `"target": "serial"`, `"target": ""`, "logging.target is required"},
+		{"mtu too small", `"mtu": 1480`, `"mtu": 67`, "mtu 67 is outside"},
+		{"mtu too large", `"mtu": 1480`, `"mtu": 65536`, "mtu 65536 is outside"},
+		{"negative mtu", `"mtu": 1480`, `"mtu": -1`, "mtu -1 is outside"},
+		{"boot_timer not a bool", `"boot_timer": true`, `"boot_timer": "yes"`, "boot_timer"},
 		{"duplicate interface", `"interfaces": [{"name": "eth0",`, `"interfaces": [{"name": "eth0"}, {"name": "eth0",`, "duplicate"},
 	}
 	for _, tt := range tests {

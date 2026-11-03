@@ -53,6 +53,8 @@ HOST_CIDR=$GW/30              # what the host puts on the TAP
 ROUTED=0                      # 1 => host also needs a /32 route to the guest
 HTTP_PORT=${HTTP_PORT:-18080}
 ROOT_DEVICE=/dev/vdb          # Firecracker names drives in PUT order: blob vda, root vdb
+MTU=                          # set => the config carries it and the probe checks it
+BOOT_TIMER=0                  # 1 => config boot_timer, Firecracker --boot-timer
 
 # ---- the handoff ------------------------------------------------------------
 MODE=supervise                # supervise | wrap
@@ -74,6 +76,7 @@ MIN_STOP_SECS=0               # CAD -> VM exit must take at least this long
 
 case $SCENARIO in
   base)
+    BOOT_TIMER=1
     EXPECT_RESET='zpinit: reset intent=shutdown cause=stop status=0' ;;
   routed32)
     HOST=vmsetup-test-03
@@ -83,6 +86,7 @@ case $SCENARIO in
     CONFIG_MAC=$GUEST_MAC
     HOST_CIDR=$GW/32
     ROUTED=1
+    MTU=1480                    # fctl's scnd driver: ipip
     EXPECT_RESET='zpinit: reset intent=shutdown cause=stop status=0' ;;
   command)
     MODE=wrap; PROBE_USER=app; ACTION=none; NEEDS_MACHINE_MODE=1
@@ -133,7 +137,7 @@ esac
 PROBE_ARGV=(
   /usr/local/bin/vmprobe
   -hostname "$HOST"
-  -interface eth0 -address "$GUEST_CIDR" -gateway "$GW"
+  -interface eth0 -address "$GUEST_CIDR" -gateway "$GW" -mtu "${MTU:-0}"
   -nameserver "$NAMESERVER"
   -uid "$EXPECT_UID" -gid "$EXPECT_GID"
   -env IMAGE_VAR=from-image
@@ -244,6 +248,11 @@ else
   HANDOFF="\"stop_signal\": \"SIGTERM\",
     \"stop_timeout\": \"$STOP_TIMEOUT\""
 fi
+IFACE_MTU=
+[ -n "$MTU" ] && IFACE_MTU=", \"mtu\": $MTU"
+EXTRA=
+[ "$BOOT_TIMER" = 1 ] && EXTRA=',
+  "boot_timer": true'
 cat > "$DIR/config.json" <<EOF
 {
   "hostname": "$HOST",
@@ -259,13 +268,13 @@ cat > "$DIR/config.json" <<EOF
   ],
   "network": {
     "interfaces": [
-      { "name": "eth0", "mac": "$CONFIG_MAC", "address": "$GUEST_CIDR", "gateway": "$GW", "mmds": true }
+      { "name": "eth0", "mac": "$CONFIG_MAC", "address": "$GUEST_CIDR", "gateway": "$GW", "mmds": true$IFACE_MTU }
     ],
     "nameservers": ["$NAMESERVER"],
     "extra_hosts": [{ "ip": "10.0.0.5", "host": "db.internal" }]
   },
   "root": { "device": "$ROOT_DEVICE", "fstype": "ext4" },
-  "logging": { "target": "serial" }
+  "logging": { "target": "serial" }$EXTRA
 }
 EOF
 "$DIR/bin/mkblob" "${BLOB_FLAGS[@]}" "$DIR/config.json" "$BLOB"
@@ -288,6 +297,7 @@ STAYS_UP=$STAYS_UP
 NEEDS_MACHINE_MODE=$NEEDS_MACHINE_MODE
 EXPECT_RESET='$EXPECT_RESET'
 MIN_STOP_SECS=$MIN_STOP_SECS
+BOOT_TIMER=$BOOT_TIMER
 EOF
 
 echo

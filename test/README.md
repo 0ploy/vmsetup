@@ -30,10 +30,10 @@ route.
 
 | Scenario | Proves |
 | --- | --- |
-| `base` | supervise mode: the probe, run as a zpinit service, checks the root is the writable disk, `/run/zpinit/bin` is a read-only tmpfs, `/proc/1/exe` is the bundle's zpinit, the initramfs was freed, `machine.json` and `/run/zpinit/env` are mode 0600, the mount table and its flags, network, identity, env, user, the process chain `probe → zpinit(1)` and the initial PID namespace |
-| `routed32` | `base` on a routed `/32` with the onlink default route |
-| `park` | a MAC no NIC has: `parked step=network`, zpinit idles in rescue, the VM stays up until stopped |
-| `noroot` | a root device that does not exist: `parked step=root`, zpinit idles in the initramfs |
+| `base` | the boot timer: Firecracker logs `Guest-boot-time` for vmsetup's write. And supervise mode: the probe, run as a zpinit service, checks the root is the writable disk, `/run/zpinit/bin` is a read-only tmpfs, `/proc/1/exe` is the bundle's zpinit, the initramfs was freed, `machine.json` and `/run/zpinit/env` are mode 0600, the mount table and its flags, network, identity, env, user, the process chain `probe → zpinit(1)` and the initial PID namespace |
+| `routed32` | `base` on a routed `/32` with the onlink default route and MTU 1480, without the boot timer, and with no write to its address |
+| `park` | a MAC no NIC has: after the 2 s wait, `parked step=network`, zpinit idles in rescue, the VM stays up until stopped |
+| `noroot` | a root device that never appears: vmsetup waits the full 2 s, then `parked step=root` naming it, and zpinit idles in the initramfs |
 | `nozpinit` | a bundle without zpinit: `parked step=handoff`, then the VM ends at once, with no panic and no reset line from vmsetup |
 | `blob-magic`, `blob-version`, `blob-noparam` | a wrong magic, a version-2 header and a missing `vmsetup_config=` each park with `step=config` |
 | `command` | wrap mode: the probe as `handoff.command`, as uid 1000, child of zpinit(1); it exits → `cause=exit status=0` |
