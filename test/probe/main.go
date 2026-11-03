@@ -73,7 +73,7 @@ func main() {
 		ignoreTerm = flag.Bool("ignore-term", false, "ignore SIGTERM, so a graceful stop has to escalate to SIGKILL")
 		chain      = flag.String("chain", "zpinit", "expected ancestors' comm, nearest first, ending at PID 1")
 		envFile    = flag.String("envfile", "", "env file vmsetup writes; checked for presence and mode 0600")
-		sessLeader = flag.Bool("session-leader", false, "expect to be a session leader")
+		groupLead  = flag.Bool("group-leader", false, "expect to lead my own process group, so zpinit's stop signals and final SIGKILL can target the group")
 		pid1Exe    = flag.String("pid1-exe", "/run/zpinit/bin/zpinit", "what /proc/1/exe must point at: the bundle's zpinit, never the image's")
 		expectEnv  envList
 	)
@@ -227,9 +227,9 @@ func main() {
 	if exe, err := os.Readlink("/proc/1/exe"); err == nil {
 		c.check("pid1 is the bundle's zpinit", exe == *pid1Exe, exe)
 	}
-	if *sessLeader {
-		sid, _ := unix.Getsid(0)
-		c.check("session leader", sid == os.Getpid(), fmt.Sprintf("sid=%d pid=%d", sid, os.Getpid()))
+	if *groupLead {
+		pgid := unix.Getpgrp()
+		c.check("process-group leader", pgid == os.Getpid(), fmt.Sprintf("pgid=%d pid=%d", pgid, os.Getpid()))
 	}
 
 	if *serve != "" {

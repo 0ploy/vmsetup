@@ -133,10 +133,14 @@ if [ "$triggered" = 1 ] && [ "$ACTION" = cad ]; then
   CAD_SENT=1
   # A Ctrl+Alt+Del that arrives before the guest's i8042/atkbd driver has
   # finished probing is lost: the initramfs boot reaches the probe's report
-  # in ~0.4 s. Resend while the VM is still up, as fctl's stop has to.
+  # in ~0.4 s. Resend while the VM is still up, as fctl's stop has to, but
+  # only until zpinit has accepted the stop: a resend during a timed stop
+  # would test something else. The stop is timed from the accepted send.
+  # "msg=stopping" is zpinit's log line, used here only as that signal.
+  accepted() { grep -q 'msg=stopping' "$SERIAL"; }
   for _ in $(seq 6); do
-    for _ in $(seq 10); do alive || break 2; sleep 0.1; done
-    [ "$MIN_STOP_SECS" != 0 ] && break   # a slow stop is the point there
+    for _ in $(seq 10); do alive || break 2; accepted && break 2; sleep 0.1; done
+    STOP_AT=$(now)
     cad >/dev/null 2>&1 && CAD_SENT=$((CAD_SENT + 1))
   done
   [ "$CAD_SENT" -gt 1 ] && echo "note: Ctrl+Alt+Del sent $CAD_SENT times before the VM ended"

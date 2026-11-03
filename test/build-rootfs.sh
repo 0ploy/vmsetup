@@ -90,15 +90,15 @@ case $SCENARIO in
     EXPECT_RESET='zpinit: reset intent=shutdown cause=stop status=0' ;;
   command)
     MODE=wrap; PROBE_USER=app; ACTION=none; NEEDS_MACHINE_MODE=1
-    PROBE_FLAGS=(-session-leader)
+    PROBE_FLAGS=(-group-leader)
     EXPECT_RESET='zpinit: reset intent=shutdown cause=exit status=0' ;;
   stop)
     MODE=wrap; PROBE_USER=app; NEEDS_MACHINE_MODE=1
-    PROBE_FLAGS=(-session-leader -hold)
+    PROBE_FLAGS=(-group-leader -hold)
     EXPECT_RESET='zpinit: reset intent=shutdown cause=stop signal=SIGTERM' ;;
   stopkill)
     MODE=wrap; PROBE_USER=app; STOP_TIMEOUT=2s; MIN_STOP_SECS=2; NEEDS_MACHINE_MODE=1
-    PROBE_FLAGS=(-session-leader -hold -ignore-term)
+    PROBE_FLAGS=(-group-leader -hold -ignore-term)
     EXPECT_RESET='zpinit: reset intent=shutdown cause=stop signal=SIGKILL' ;;
   park)
     CONFIG_MAC=06:00:DE:AD:BE:EF

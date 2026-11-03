@@ -36,7 +36,7 @@ route.
 | `noroot` | a root device that never appears: vmsetup waits the full 2 s, then `parked step=root` naming it, and zpinit idles in the initramfs |
 | `nozpinit` | a bundle without zpinit: `parked step=handoff`, then the VM ends at once, with no panic and no reset line from vmsetup |
 | `blob-magic`, `blob-version`, `blob-noparam` | a wrong magic, a version-2 header and a missing `vmsetup_config=` each park with `step=config` |
-| `command` | wrap mode: the probe as `handoff.command`, as uid 1000, child of zpinit(1); it exits → `cause=exit status=0` |
+| `command` | wrap mode: the probe as `handoff.command`, as uid 1000, child of zpinit(1) and leader of its own process group; it exits → `cause=exit status=0` |
 | `stop`, `stopkill` | wrap-mode stop: `stop_signal`, then `SIGKILL` at `stop_timeout` |
 
 `command`, `stop` and `stopkill`, and the reset line in every scenario, need
